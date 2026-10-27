@@ -1,6 +1,13 @@
 --// Written by depso
 --// MIT License
 --// Copyright (c) 2024 Depso
+--//
+--// Maintained fork of Depso's Roblox ImGui (the original project is discontinued).
+--// Changes in this fork:
+--//  * Built-in UI prefabs, used automatically when the original asset can't be loaded
+--//  * Touch / mobile support (drag, resize, sliders, dropdowns, keybinds, window focus)
+--//  * Optional UIScale for touch-only devices + windows are kept on screen
+--//  * Bug fixes (see the notes next to each change marked with "FIX")
 
 local ImGui = {
 	Animations = {
@@ -42,14 +49,19 @@ local ImGui = {
 
 	Windows = {},
 	Animation = TweenInfo.new(0.1),
-	UIAssetId = "rbxassetid://76246418997296"
+	UIAssetId = "rbxassetid://76246418997296",
+
+	--// Mobile / touch
+	TouchScale = 1.2, --// Window scale used on touch-only devices (set to 1 to disable)
+	Scale = 1,
+	ClampToScreen = true --// Keep windows inside the screen
 }
 
 
 --// Universal functions
 local NullFunction = function() end
 local CloneRef = cloneref or function(_)return _ end
-local function GetService(...): ServiceProvider
+local function GetService(...)
 	return CloneRef(game:GetService(...))
 end
 
@@ -67,14 +79,794 @@ local RunService: RunService = GetService("RunService")
 
 --// LocalPlayer
 local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer.PlayerGui
-local Mouse = LocalPlayer:GetMouse()
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 --// ImGui Config
 local IsStudio = RunService:IsStudio()
 ImGui.NoWarnings = not IsStudio
 
---// Prefabs
+--// Touch-only devices (phones/tablets without a keyboard) get a bigger UI
+ImGui.IsMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+ImGui.Scale = ImGui.IsMobile and ImGui.TouchScale or 1
+
+--// Input helpers
+local MouseButton1 = Enum.UserInputType.MouseButton1
+local MouseMovement = Enum.UserInputType.MouseMovement
+local Touch = Enum.UserInputType.Touch
+
+local function IsPointerStart(Input: InputObject): boolean
+	local Type = Input.UserInputType
+	return Type == MouseButton1 or Type == Touch
+end
+
+local function IsPointInside(GuiObject: GuiObject, Position: Vector3 | Vector2): boolean
+	local Pos = GuiObject.AbsolutePosition
+	local Size = GuiObject.AbsoluteSize
+	return Position.X >= Pos.X and Position.X <= Pos.X + Size.X
+		and Position.Y >= Pos.Y and Position.Y <= Pos.Y + Size.Y
+end
+
+--// Scale / screen helpers
+function ImGui:GetScale(): number
+	return self.Scale or 1
+end
+
+function ImGui:GetViewportSize(): Vector2
+	local Gui = self.ScreenGui
+	local Size = Gui and Gui.AbsoluteSize or Vector2.zero
+
+	if Size.X <= 0 or Size.Y <= 0 then
+		local Camera = workspace.CurrentCamera
+		Size = Camera and Camera.ViewportSize or Vector2.new(1280, 720)
+	end
+	return Size
+end
+
+--// Make sure a window size never exceeds the screen (phones are small!)
+function ImGui:ClampSizeToScreen(Size: UDim2): UDim2
+	if not self.ClampToScreen then return Size end
+
+	local Viewport = self:GetViewportSize()
+	local Scale = self:GetScale()
+	local MaxX = math.floor(Viewport.X * 0.96 / Scale)
+	local MaxY = math.floor(Viewport.Y * 0.92 / Scale)
+
+	local X, Y = Size.X, Size.Y
+	if X.Scale == 0 and X.Offset > MaxX then X = UDim.new(0, MaxX) end
+	if Y.Scale == 0 and Y.Offset > MaxY then Y = UDim.new(0, MaxY) end
+
+	return UDim2.new(X, Y)
+end
+
+--// Keep a part of the window reachable so it can't get lost off screen
+function ImGui:ClampWindowPosition(Window: GuiObject)
+	if not self.ClampToScreen then return end
+	if not Window or not Window.Parent or Window.Parent ~= self.ScreenGui then return end
+
+	local Viewport = self:GetViewportSize()
+	local Pos = Window.AbsolutePosition
+	local Size = Window.AbsoluteSize
+	local Keep = 48 --// Pixels that must stay visible
+
+	local TargetX = math.clamp(Pos.X, Keep - Size.X, Viewport.X - Keep)
+	local TargetY = math.clamp(Pos.Y, 0, Viewport.Y - Keep)
+	local DeltaX, DeltaY = TargetX - Pos.X, TargetY - Pos.Y
+	if DeltaX == 0 and DeltaY == 0 then return end
+
+	local Current = Window.Position
+	Window.Position = UDim2.new(
+		Current.X.Scale, Current.X.Offset + DeltaX,
+		Current.Y.Scale, Current.Y.Offset + DeltaY
+	)
+end
+
+function ImGui:SetScale(Scale: number)
+	Scale = math.clamp(tonumber(Scale) or 1, 0.5, 3)
+	self.Scale = Scale
+
+	for Window in next, self.Windows do
+		local UIScale = Window:FindFirstChildOfClass("UIScale")
+		if UIScale then
+			UIScale.Scale = Scale
+		end
+	end
+	return self
+end
+
+--// Built-in prefabs 
+--// Used when the original asset can't be loaded (deleted, GetObjects unsupported, ...)
+--// The hierarchy/names match what the rest of this file expects.
+function ImGui:BuildFallbackUI()
+	local Theme = {
+		WindowBg = Color3.fromRGB(15, 15, 15),
+		TitleBg = Color3.fromRGB(41, 74, 122),
+		Frame = Color3.fromRGB(66, 150, 250),
+		FrameDark = Color3.fromRGB(41, 74, 122),
+		Grab = Color3.fromRGB(61, 133, 224),
+		Border = Color3.fromRGB(110, 110, 128),
+		Text = Color3.fromRGB(255, 255, 255),
+		TextDim = Color3.fromRGB(140, 140, 140),
+		Font = Enum.Font.Code,
+		TextSize = 14
+	}
+
+	local function New(ClassName: string, Properties, Children)
+		local Object = Instance.new(ClassName)
+		local Parent = nil
+
+		for Key, Value in next, Properties or {} do
+			if Key == "Parent" then
+				Parent = Value
+			else
+				Object[Key] = Value
+			end
+		end
+		for _, Child in next, Children or {} do
+			Child.Parent = Object
+		end
+
+		Object.Parent = Parent
+		return Object
+	end
+
+	--// Frame/Text constructors with shared defaults
+	local function Box(ClassName: string, Properties, Children)
+		local Props = {
+			BorderSizePixel = 0,
+			BackgroundTransparency = 1,
+		}
+		for Key, Value in next, Properties or {} do
+			Props[Key] = Value
+		end
+		return New(ClassName, Props, Children)
+	end
+
+	local function Text(ClassName: string, Properties, Children)
+		local Props = {
+			BorderSizePixel = 0,
+			BackgroundTransparency = 1,
+			Font = Theme.Font,
+			TextSize = Theme.TextSize,
+			TextColor3 = Theme.Text,
+		}
+		if ClassName == "TextButton" then
+			Props.AutoButtonColor = false
+			Props.Text = ""
+		end
+		for Key, Value in next, Properties or {} do
+			Props[Key] = Value
+		end
+		return New(ClassName, Props, Children)
+	end
+
+	local function Padding(Left: number, Top: number?, Right: number?, Bottom: number?)
+		Top = Top or Left
+		return New("UIPadding", {
+			PaddingLeft = UDim.new(0, Left),
+			PaddingTop = UDim.new(0, Top),
+			PaddingRight = UDim.new(0, Right or Left),
+			PaddingBottom = UDim.new(0, Bottom or Top),
+		})
+	end
+
+	local function Corner(Radius: UDim | number)
+		return New("UICorner", {
+			CornerRadius = typeof(Radius) == "UDim" and Radius or UDim.new(0, Radius)
+		})
+	end
+
+	local function Stroke(Enabled: boolean?)
+		return New("UIStroke", {
+			Color = Theme.Border,
+			Thickness = 1,
+			Transparency = 0.5,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Enabled = Enabled ~= false
+		})
+	end
+
+	local function List(PaddingPx: number?, Horizontal: boolean?, Center: boolean?)
+		return New("UIListLayout", {
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0, PaddingPx or 0),
+			FillDirection = Horizontal and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+			VerticalAlignment = Center and Enum.VerticalAlignment.Center or Enum.VerticalAlignment.Top
+		})
+	end
+
+	local function Gradient()
+		return New("UIGradient", {Enabled = false})
+	end
+
+	--// Arrow used by windows, headers and combos (rotates 90 when open)
+	local function Arrow(LayoutOrder: number?)
+		return Box("Frame", {
+			Name = "Toggle",
+			LayoutOrder = LayoutOrder or 1,
+			Size = UDim2.fromOffset(22, 22),
+		}, {
+			Box("ImageButton", {
+				Name = "ToggleButton",
+				Size = UDim2.fromScale(1, 1),
+				BackgroundColor3 = Theme.Frame,
+				AutoButtonColor = false,
+			}, {
+				Corner(4),
+				Text("TextLabel", {
+					Name = "Arrow",
+					Text = ">",
+					TextSize = 13,
+					Size = UDim2.fromScale(1, 1),
+				})
+			})
+		})
+	end
+
+	--// Prefabs
+	local Prefabs = Box("Frame", {Name = "Prefabs", Visible = false})
+
+	local function Add(Prefab: Instance)
+		Prefab.Parent = Prefabs
+		return Prefab
+	end
+
+	--// Window
+	Add(Box("Frame", {
+		Name = "Window",
+		Size = UDim2.fromOffset(300, 200),
+		Position = UDim2.fromOffset(60, 60),
+		BackgroundColor3 = Theme.WindowBg,
+		BackgroundTransparency = 0.05,
+		ClipsDescendants = true,
+		Visible = false,
+	}, {
+		Stroke(),
+		Corner(4),
+		Box("Frame", {
+			Name = "Content",
+			Size = UDim2.fromScale(1, 1),
+		}, {
+			List(0),
+			Box("Frame", {
+				Name = "TitleBar",
+				LayoutOrder = 1,
+				Size = UDim2.new(1, 0, 0, 28),
+				BackgroundColor3 = Theme.TitleBg,
+				BackgroundTransparency = 0,
+			}, {
+				Box("Frame", {
+					Name = "Left",
+					Size = UDim2.new(1, -32, 1, 0),
+				}, {
+					List(4, true, true),
+					Padding(4, 0, 0, 0),
+					Arrow(1),
+					Text("TextLabel", {
+						Name = "Title",
+						LayoutOrder = 2,
+						Text = "Window",
+						AutomaticSize = Enum.AutomaticSize.XY,
+						Size = UDim2.fromOffset(0, 0),
+						TextXAlignment = Enum.TextXAlignment.Left,
+					})
+				}),
+				Text("TextButton", {
+					Name = "Close",
+					Text = "X",
+					AnchorPoint = Vector2.new(1, 0.5),
+					Position = UDim2.new(1, -3, 0.5, 0),
+					Size = UDim2.fromOffset(24, 24),
+					BackgroundColor3 = Theme.Frame,
+				}, {
+					Corner(4)
+				})
+			}),
+			Box("ScrollingFrame", {
+				Name = "ToolBar",
+				LayoutOrder = 2,
+				Size = UDim2.new(1, 0, 0, 28),
+				ScrollBarThickness = 0,
+				ScrollingDirection = Enum.ScrollingDirection.X,
+				AutomaticCanvasSize = Enum.AutomaticSize.X,
+				CanvasSize = UDim2.new(),
+				ElasticBehavior = Enum.ElasticBehavior.Never,
+			}, {
+				List(2, true, true),
+				Padding(4, 0, 4, 0),
+				Text("TextButton", {
+					Name = "TabButton",
+					Visible = false,
+					Text = "Tab",
+					AutomaticSize = Enum.AutomaticSize.X,
+					Size = UDim2.fromOffset(0, 24),
+					BackgroundColor3 = Theme.Frame,
+				}, {
+					Padding(10, 0, 10, 0),
+					Corner(4),
+				})
+			}),
+			Box("ScrollingFrame", {
+				Name = "Body",
+				LayoutOrder = 3,
+				Size = UDim2.new(1, 0, 1, -56),
+				ScrollBarThickness = 6,
+				ScrollBarImageColor3 = Theme.Border,
+				ScrollingDirection = Enum.ScrollingDirection.Y,
+				AutomaticCanvasSize = Enum.AutomaticSize.Y,
+				CanvasSize = UDim2.new(),
+				ElasticBehavior = Enum.ElasticBehavior.Never,
+			}, {
+				--// Tab page template (cloned by CreateTab)
+				Box("Frame", {
+					Name = "Template",
+					Visible = false,
+					Size = UDim2.fromScale(1, 0),
+					AutomaticSize = Enum.AutomaticSize.Y,
+				}, {
+					List(4),
+					Padding(8)
+				})
+			})
+		}),
+		Text("TextButton", {
+			Name = "ResizeGrab",
+			Text = "◢",
+			TextSize = 14,
+			TextTransparency = 0.6,
+			ZIndex = 10,
+			AnchorPoint = Vector2.new(1, 1),
+			Position = UDim2.fromScale(1, 1),
+			Size = UDim2.fromOffset(24, 24),
+		})
+	}))
+
+	--// Button
+	Add(Text("TextButton", {
+		Name = "Button",
+		Text = "Button",
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, 26),
+		BackgroundColor3 = Theme.Frame,
+		BackgroundTransparency = 0.7,
+	}, {
+		Padding(10, 0, 10, 0),
+		Corner(3),
+		Stroke(false),
+		Gradient(),
+	}))
+
+	--// Image
+	Add(Text("ImageButton", {
+		Name = "Image",
+		Size = UDim2.fromOffset(50, 50),
+		BackgroundColor3 = Theme.Frame,
+		BackgroundTransparency = 0.7,
+		AutoButtonColor = false,
+	}, {
+		Corner(3),
+		Stroke(false),
+		Gradient(),
+	}))
+
+	--// ScrollBox
+	Add(Box("ScrollingFrame", {
+		Name = "ScrollBox",
+		Size = UDim2.new(1, 0, 0, 200),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.5,
+		ScrollBarThickness = 6,
+		ScrollBarImageColor3 = Theme.Border,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(),
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+	}, {
+		List(4),
+		Padding(6),
+		Stroke(),
+	}))
+
+	--// Label
+	Add(Text("TextLabel", {
+		Name = "Label",
+		Text = "Label",
+		AutomaticSize = Enum.AutomaticSize.XY,
+		Size = UDim2.fromOffset(0, 0),
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}))
+
+	--// CheckBox / RadioButton
+	Add(Text("TextButton", {
+		Name = "CheckBox",
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, 26),
+	}, {
+		List(6, true, true),
+		Text("ImageButton", {
+			Name = "Tickbox",
+			LayoutOrder = 1,
+			Size = UDim2.fromOffset(22, 22),
+			BackgroundColor3 = Theme.Frame,
+			BackgroundTransparency = 0.7,
+			ClipsDescendants = true,
+		}, {
+			Padding(4),
+			Corner(UDim.new(1, 0)),
+			Box("ImageLabel", {
+				Name = "Tick",
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				Size = UDim2.fromScale(0, 0),
+				BackgroundColor3 = Theme.Grab,
+				BackgroundTransparency = 0,
+			})
+		}),
+		Text("TextLabel", {
+			Name = "Label",
+			LayoutOrder = 2,
+			Text = "CheckBox",
+			AutomaticSize = Enum.AutomaticSize.XY,
+			Size = UDim2.fromOffset(0, 0),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		})
+	}))
+
+	--// Viewport
+	Add(Box("Frame", {
+		Name = "Viewport",
+		Size = UDim2.fromOffset(200, 200),
+	}, {
+		New("ViewportFrame", {
+			Name = "Viewport",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color3.new(0, 0, 0),
+			BackgroundTransparency = 0.5,
+			BorderSizePixel = 0,
+		}, {
+			New("WorldModel", {Name = "WorldModel"})
+		})
+	}))
+
+	--// TextInput
+	Add(Box("Frame", {
+		Name = "TextInput",
+		Size = UDim2.new(1, 0, 0, 26),
+		BackgroundColor3 = Theme.FrameDark,
+		BackgroundTransparency = 0.5,
+	}, {
+		Corner(3),
+		Text("TextBox", {
+			Name = "Input",
+			Size = UDim2.fromScale(1, 1),
+			Text = "",
+			PlaceholderColor3 = Theme.TextDim,
+			ClearTextOnFocus = false,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ClipsDescendants = true,
+		}, {
+			Padding(6, 0, 6, 0)
+		}),
+		Text("TextLabel", {
+			Name = "Label",
+			Text = "",
+			TextColor3 = Theme.TextDim,
+			AutomaticSize = Enum.AutomaticSize.XY,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -6, 0.5, 0),
+			Size = UDim2.fromOffset(0, 0),
+			Active = false,
+		})
+	}))
+
+	--// Console
+	Add(Box("ScrollingFrame", {
+		Name = "Console",
+		Size = UDim2.new(1, 0, 0, 200),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.5,
+		ScrollBarThickness = 6,
+		ScrollBarImageColor3 = Theme.Border,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(),
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+	}, {
+		Text("TextLabel", {
+			Name = "Lines",
+			Visible = false,
+			Text = "",
+			TextColor3 = Theme.TextDim,
+			AutomaticSize = Enum.AutomaticSize.XY,
+			Size = UDim2.fromOffset(0, 0),
+			TextXAlignment = Enum.TextXAlignment.Right,
+			TextYAlignment = Enum.TextYAlignment.Top,
+		}, {
+			Padding(4, 2, 4, 2)
+		}),
+		Text("TextBox", {
+			Name = "Source",
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.fromScale(1, 0),
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Text = "",
+			MultiLine = true,
+			ClearTextOnFocus = false,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+		}, {
+			Padding(4, 2, 4, 2)
+		})
+	}))
+
+	--// Table
+	Add(Box("Frame", {
+		Name = "Table",
+		Size = UDim2.fromScale(1, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+	}, {
+		List(2),
+		Box("Frame", {
+			Name = "RowTemp",
+			Visible = false,
+			Size = UDim2.fromScale(1, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+		}, {
+			List(0, true),
+			Box("Frame", {
+				Name = "ColumnTemp",
+				Visible = false,
+				Size = UDim2.fromScale(0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+			}, {
+				List(4),
+				Padding(4),
+				Stroke(),
+			})
+		})
+	}))
+
+	--// CollapsingHeader / TreeNode
+	Add(Box("Frame", {
+		Name = "CollapsingHeader",
+		Size = UDim2.fromScale(1, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+	}, {
+		List(0),
+		Text("TextButton", {
+			Name = "TitleBar",
+			LayoutOrder = 1,
+			Size = UDim2.new(1, 0, 0, 26),
+			BackgroundColor3 = Theme.Frame,
+			BackgroundTransparency = 0.7,
+		}, {
+			List(4, true, true),
+			Padding(4, 0, 4, 0),
+			Corner(3),
+			Arrow(1),
+			Text("TextLabel", {
+				Name = "Title",
+				LayoutOrder = 2,
+				Text = "Header",
+				AutomaticSize = Enum.AutomaticSize.XY,
+				Size = UDim2.fromOffset(0, 0),
+				TextXAlignment = Enum.TextXAlignment.Left,
+			})
+		}),
+		Box("Frame", {
+			Name = "ChildContainer",
+			LayoutOrder = 2,
+			Size = UDim2.new(1, -10, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+		}, {
+			List(4),
+			Padding(0, 4, 0, 4),
+		})
+	}))
+
+	--// SeparatorText
+	Add(Box("Frame", {
+		Name = "SeparatorText",
+		Size = UDim2.new(1, 0, 0, 18),
+	}, {
+		Box("Frame", {
+			Name = "Line",
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.fromScale(0, 0.5),
+			Size = UDim2.new(1, 0, 0, 1),
+			BackgroundColor3 = Theme.Border,
+			BackgroundTransparency = 0.5,
+		}),
+		Text("TextLabel", {
+			Name = "TextLabel",
+			Text = "",
+			AutomaticSize = Enum.AutomaticSize.XY,
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 10, 0.5, 0),
+			Size = UDim2.fromOffset(0, 0),
+			BackgroundColor3 = Theme.WindowBg,
+			BackgroundTransparency = 0,
+		}, {
+			Padding(4, 0, 4, 0)
+		})
+	}))
+
+	--// Row
+	Add(Box("Frame", {
+		Name = "Row",
+		Size = UDim2.fromScale(1, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+	}, {
+		List(4, true, true),
+		Padding(0),
+	}))
+
+	--// Slider (label sits to the right of the bar)
+	Add(Text("TextButton", {
+		Name = "Slider",
+		Size = UDim2.new(1, -120, 0, 24),
+		BackgroundColor3 = Theme.FrameDark,
+		BackgroundTransparency = 0.5,
+	}, {
+		Padding(10, 0, 10, 0),
+		Corner(3),
+		Box("Frame", {
+			Name = "Grab",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0, 0.5),
+			Size = UDim2.new(0, 10, 1, -4),
+			BackgroundColor3 = Theme.Grab,
+			BackgroundTransparency = 0,
+		}, {
+			Corner(3),
+			Gradient(),
+		}),
+		Text("TextLabel", {
+			Name = "ValueText",
+			Text = "0",
+			Size = UDim2.fromScale(1, 1),
+			ZIndex = 2,
+		}),
+		Text("TextLabel", {
+			Name = "Label",
+			Text = "",
+			Position = UDim2.new(1, 15, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.XY,
+			Size = UDim2.fromOffset(0, 24),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		})
+	}))
+
+	--// Keybind
+	Add(Text("TextButton", {
+		Name = "Keybind",
+		Size = UDim2.new(1, -120, 0, 24),
+		BackgroundColor3 = Theme.FrameDark,
+		BackgroundTransparency = 0.5,
+	}, {
+		Corner(3),
+		Text("TextLabel", {
+			Name = "ValueText",
+			Text = "Not set",
+			Size = UDim2.fromScale(1, 1),
+		}),
+		Text("TextLabel", {
+			Name = "Label",
+			Text = "",
+			Position = UDim2.new(1, 10, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.XY,
+			Size = UDim2.fromOffset(0, 24),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		})
+	}))
+
+	--// Combo
+	Add(Text("TextButton", {
+		Name = "Combo",
+		Size = UDim2.new(1, -120, 0, 24),
+		BackgroundColor3 = Theme.FrameDark,
+		BackgroundTransparency = 0.5,
+	}, {
+		Corner(3),
+		Text("TextLabel", {
+			Name = "ValueText",
+			Text = "",
+			Size = UDim2.new(1, -26, 1, 0),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}, {
+			Padding(8, 0, 0, 0)
+		}),
+		Box("Frame", {
+			Name = "Toggle",
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -1, 0.5, 0),
+			Size = UDim2.fromOffset(22, 22),
+		}, {
+			Box("ImageButton", {
+				Name = "ToggleButton",
+				Size = UDim2.fromScale(1, 1),
+				BackgroundColor3 = Theme.Frame,
+				AutoButtonColor = false,
+			}, {
+				Corner(3),
+				Text("TextLabel", {
+					Name = "Arrow",
+					Text = ">",
+					TextSize = 13,
+					Size = UDim2.fromScale(1, 1),
+				})
+			})
+		}),
+		Text("TextLabel", {
+			Name = "Label",
+			Text = "",
+			Position = UDim2.new(1, 10, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.XY,
+			Size = UDim2.fromOffset(0, 24),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		})
+	}))
+
+	--// Selection (dropdown list for Combos)
+	Add(Box("ScrollingFrame", {
+		Name = "Selection",
+		Size = UDim2.fromOffset(150, 100),
+		BackgroundColor3 = Color3.fromRGB(20, 20, 20),
+		BackgroundTransparency = 0,
+		ScrollBarThickness = 4,
+		ScrollBarImageColor3 = Theme.Border,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(),
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ZIndex = 50,
+	}, {
+		Stroke(),
+		List(0),
+		Text("TextButton", {
+			Name = "Template",
+			Text = "Item",
+			ZIndex = 51,
+			Size = UDim2.new(1, 0, 0, 26),
+			BackgroundColor3 = Theme.Frame,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, {
+			Padding(8, 0, 0, 0)
+		})
+	}))
+
+	--// ModalEffect
+	Add(Box("Frame", {
+		Name = "ModalEffect",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.6,
+		Active = true,
+		Visible = false,
+	}))
+
+	return New("ScreenGui", {Name = "DepsoImGui"}, {Prefabs})
+end
+
+--// Prefabs 
+local RequiredPrefabs = {
+	"Window", "Button", "Image", "ScrollBox", "Label", "CheckBox", "Viewport",
+	"TextInput", "Console", "Table", "CollapsingHeader", "SeparatorText", "Row",
+	"Slider", "Keybind", "Combo", "Selection", "ModalEffect"
+}
+
+local function IsValidUI(UI): boolean
+	if typeof(UI) ~= "Instance" then return false end
+
+	local Prefabs = UI:FindFirstChild("Prefabs")
+	if not Prefabs then return false end
+
+	for _, Name in RequiredPrefabs do
+		if not Prefabs:FindFirstChild(Name) then
+			return false
+		end
+	end
+	return true
+end
+
 function ImGui:FetchUI()
 	--// Cache check 
 	local CacheName = "DepsoImGui"
@@ -85,13 +877,30 @@ function ImGui:FetchUI()
 
 	local UI = nil
 
-	--// Universal
-	if not IsStudio then
-		local UIAssetId = ImGui.UIAssetId
-		UI = game:GetObjects(UIAssetId)[1]
-	else --// Studio
+	if IsStudio then
+		--// Studio
 		local UIName = "DepsoImGui"
-		UI = PlayerGui:FindFirstChild(UIName) or script.DepsoImGui
+		UI = PlayerGui:FindFirstChild(UIName)
+		if not UI and typeof(script) == "Instance" then
+			UI = script:FindFirstChild(UIName)
+		end
+	elseif not _G.ImGuiForceFallback then
+		--// Universal: load the original asset
+		--// FIX: the asset can be deleted or GetObjects can be unavailable, don't hard error
+		local Success, Result = pcall(function()
+			return game:GetObjects(ImGui.UIAssetId)[1]
+		end)
+		if Success and IsValidUI(Result) then
+			UI = Result
+		else
+			self.NoWarnings = false
+			self:Warn("Could not load the UI asset, using the built-in UI instead.")
+		end
+	end
+
+	--// Built-in fallback
+	if not IsValidUI(UI) then
+		UI = self:BuildFallbackUI()
 	end
 
 	_G[CacheName] = UI
@@ -199,11 +1008,13 @@ function ImGui:GetName(Name: string)
 end
 
 function ImGui:CreateInstance(Class, Parent, Properties)
-	local Instance = Instance.new(Class, Parent)
+	local Object = Instance.new(Class)
 	for Key, Value in next, Properties or {} do
-		Instance[Key] = Value
+		Object[Key] = Value
 	end
-	return Instance
+	--// FIX: parent last (faster, and avoids the deprecated Instance.new parent argument)
+	Object.Parent = Parent
+	return Object
 end
 
 function ImGui:ApplyColors(ColorOverwrites, GuiObject: GuiObject, ElementType: string)
@@ -287,7 +1098,7 @@ end
 function ImGui:MergeMetatables(Class, Instance: GuiObject)
 	local Metadata = {}
 	Metadata.__index = function(self, Key)
-		local suc, Value = pcall(function()
+		local Success, Value = pcall(function()
 			local Value = Instance[Key]
 			if typeof(Value) == "function" then
 				return function(...)
@@ -296,7 +1107,12 @@ function ImGui:MergeMetatables(Class, Instance: GuiObject)
 			end
 			return Value
 		end)
-		return suc and Value or Class[Key]
+
+		--// FIX: properties that are `false` (e.g. Visible) used to fall through to the class table
+		if Success and Value ~= nil then
+			return Value
+		end
+		return Class[Key]
 	end
 
 	Metadata.__newindex = function(self, Key, Value)
@@ -413,8 +1229,11 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			Tick.ImageTransparency = 1
 			Tick.BackgroundTransparency = 0
 		else
-			Tickbox:FindFirstChildOfClass("UIPadding"):Remove()
-			Tickbox:FindFirstChildOfClass("UICorner"):Remove()
+			--// FIX: Remove() is deprecated, and the instances may be missing
+			local TickPadding = Tickbox:FindFirstChildOfClass("UIPadding")
+			local TickCorner = Tickbox:FindFirstChildOfClass("UICorner")
+			if TickPadding then TickPadding:Destroy() end
+			if TickCorner then TickCorner:Destroy() end
 		end
 
 		--// Apply animations
@@ -522,7 +1341,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		local ObjectClass = self:NewInstance(TextInput, Config)
 
 		TextBox.Text = Config.Value or ""
-		TextBox.PlaceholderText = Config.PlaceHolder
+		TextBox.PlaceholderText = Config.PlaceHolder or ""
 		TextBox.MultiLine = Config.MultiLine == true
 
 		--// Apply animations
@@ -569,7 +1388,9 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		local PaddingBottom = Padding.PaddingBottom
 
 		local PaddingSizeY = PaddingTop+PaddingBottom+LayoutPaddding
-		local OccupiedY = Frame.AbsoluteSize.Y+PaddingSizeY.Offset+3
+
+		--// FIX: AbsoluteSize is in pixels, offsets are scaled by the window's UIScale
+		local OccupiedY = ImGui:ToLocal(Frame.AbsoluteSize.Y)+PaddingSizeY.Offset+3
 
 		return UDim2.new(1, 0, 1, -OccupiedY) 
 	end
@@ -590,6 +1411,11 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		Source.TextWrapped = Config.TextWrapped == true
 		Source.RichText = Config.RichText == true
 		Lines.Visible = Config.LineNumbers == true
+
+		--// FIX: the console used to ignore SetText/AppendText unless `Enabled = true` was passed
+		local function IsEnabled()
+			return Config.Enabled ~= false
+		end
 
 		function Config:UpdateLineNumbers()
 			if not Config.LineNumbers then return end
@@ -614,7 +1440,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		end
 
 		function Config:SetText(Text)
-			if not Config.Enabled then return end
+			if not IsEnabled() then return end
 			Source.Text = Text
 			Config:UpdateLineNumbers()
 			return Config
@@ -631,7 +1457,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		end
 
 		function Config:AppendText(...)
-			if not Config.Enabled then return end
+			if not IsEnabled() then return end
 
 			local MaxLines = Config.MaxLines or 100
 			local NewString = "\n" .. ImGui:Concat({...}, " ") 
@@ -651,7 +1477,9 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		end
 
 		--// Connect events
-		Source.Changed:Connect(Config.UpdateLineNumbers)
+		Source.Changed:Connect(function()
+			Config:UpdateLineNumbers()
+		end)
 
 		return self:NewInstance(Console, Config)
 	end
@@ -740,7 +1568,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 				if not Row:IsA("Frame") then continue end
 
 				if Row.Name == PostRowName then
-					Row:Remove()
+					Row:Destroy()
 				end
 			end
 			return Config
@@ -864,25 +1692,24 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 	-- This will use UIDragdetectors in the upcoming release, please do not report this!
 	function ContainerClass:Slider(Config)
 		Config = Config or {}
-		
+
+		--// FIX: MinValue/MaxValue used to error when they weren't provided
+		Config.MinValue = Config.MinValue or 0
+		Config.MaxValue = Config.MaxValue or 100
+
 		--// Unpack config
-		local Value = Config.Value or 0
+		local Value = Config.Value or Config.MinValue
 		local ValueFormat = Config.Format or "%.d"
 		local IsProgress = Config.Progress
 		Config.Name = Config.Label or ""
-		
+
 		--// Slider element
 		local Slider: TextButton = Prefabs.Slider:Clone()
 		local UIPadding = Slider:FindFirstChildOfClass("UIPadding")
 		local Grab: Frame = Slider.Grab
 		local ValueText = Slider.ValueText
 		local Label = Slider.Label
-		
-		--// Input data
-		local Dragging = false
-		local MouseMoveConnection = nil
-		local InputType = Enum.UserInputType.MouseButton1
-		
+
 		local ObjectClass = self:NewInstance(Slider, Config)
 
 		local function Callback(...)
@@ -898,7 +1725,9 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			local Diff = UIPadding.PaddingLeft - PaddingSides
 
 			Grab.AnchorPoint = Vector2.new(0, 0.5)
-			UIGradient.Enabled = true
+			if UIGradient then
+				UIGradient.Enabled = true
+			end
 
 			UIPadding.PaddingLeft = PaddingSides
 			UIPadding.PaddingRight = PaddingSides
@@ -910,14 +1739,18 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			local MinValue = Config.MinValue
 			local MaxValue = Config.MaxValue
 			local Difference = MaxValue - MinValue
-			local Percentage = (Value - MinValue) / Difference
+			local Percentage = 0
 
 			if not Slider then
-				Value = tonumber(Value)
+				Value = tonumber(Value) or MinValue
+				Value = math.clamp(Value, math.min(MinValue, MaxValue), math.max(MinValue, MaxValue))
+				Percentage = Difference ~= 0 and (Value - MinValue) / Difference or 0
 			else
 				Percentage = Value
 				Value = MinValue + (Difference * Percentage)
 			end
+
+			Percentage = math.clamp(Percentage, 0, 1)
 
 			--// Animate grab
 			local Props = {
@@ -943,42 +1776,57 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			return Config
 		end
 
-		------// Move events
-		local function MouseMove()
-			if Config.ReadOnly then return end
-			if not Dragging then return end
-			
-			local MouseX = UserInputService:GetMouseLocation().X
-			local LeftPos = Slider.AbsolutePosition.X
+		--// Position -> percentage (takes the slider's padding into account)
+		local function SetFromX(X: number)
+			local Width = Slider.AbsoluteSize.X
+			local PadLeft, PadRight = 0, 0
 
-			local Percentage = (MouseX-LeftPos)/Slider.AbsoluteSize.X
-			Percentage = math.clamp(Percentage, 0, 1)
-			Config:SetValue(Percentage, true)
+			if UIPadding then
+				local Scale = ImGui:GetScale()
+				PadLeft = UIPadding.PaddingLeft.Scale * Width + UIPadding.PaddingLeft.Offset * Scale
+				PadRight = UIPadding.PaddingRight.Scale * Width + UIPadding.PaddingRight.Offset * Scale
+			end
+
+			local Left = Slider.AbsolutePosition.X + PadLeft
+			local Span = math.max(Width - PadLeft - PadRight, 1)
+
+			Config:SetValue(math.clamp((X - Left) / Span, 0, 1), true)
 		end
 
-		local function InputEnded(inputObject)
-			if not Dragging then return end
-			if inputObject.UserInputType ~= InputType then return end
+		--// FIX: mouse + touch dragging (used Mouse.Move / GetMouseLocation which don't work on mobile)
+		local ScrollParent: ScrollingFrame? = nil
+		local ScrollWasEnabled = true
 
-			Dragging = false
-			MouseMoveConnection:Disconnect()
-		end
+		ImGui:ConnectDrag({
+			Target = Slider,
+			CanStart = function()
+				return not Config.ReadOnly
+			end,
+			Started = function(Input)
+				--// Stop the page from scrolling while dragging the slider with a finger
+				local Parent = Slider.Parent
+				while Parent do
+					if Parent:IsA("ScrollingFrame") then
+						ScrollParent = Parent
+						ScrollWasEnabled = Parent.ScrollingEnabled
+						Parent.ScrollingEnabled = false
+						break
+					end
+					Parent = Parent.Parent
+				end
 
-		--// Connect mouse events
-		ImGui:ConnectHover({
-			Parent = Slider,
-			OnInput = function(MouseHovering, Input)
-				if not MouseHovering then return end
-				if Input.UserInputType ~= InputType then return end
-
-				Dragging = true
-				MouseMoveConnection = Mouse.Move:Connect(MouseMove) --// Save heavy performance
+				SetFromX(Input.Position.X)
+			end,
+			Moved = function(Input)
+				SetFromX(Input.Position.X)
+			end,
+			Ended = function()
+				if ScrollParent then
+					ScrollParent.ScrollingEnabled = ScrollWasEnabled
+					ScrollParent = nil
+				end
 			end
 		})
-
-		--// Connect events
-		Slider.Activated:Connect(MouseMove)
-		UserInputService.InputEnded:Connect(InputEnded)
 
 		--// Update UI
 		Config:SetValue(Value)
@@ -1016,6 +1864,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 
 		local Keybind: TextButton = Prefabs.Keybind:Clone()
 		local ValueText: TextButton = Keybind.ValueText
+		local Listening = false
 
 		local ObjectClass = nil
 		local function Callback(...)
@@ -1023,35 +1872,50 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			return func(ObjectClass, ...)
 		end
 
+		local function UpdateText()
+			ValueText.Text = Config.Value and Config.Value.Name or "Not set"
+		end
+
 		function Config:SetValue(NewKey: Enum.KeyCode)
-			if not NewKey then return end
+			if not NewKey then
+				UpdateText()
+				return Config
+			end
 
 			if NewKey == TobeNullKey then
-				ValueText.Text = "Not set"
 				Config.Value = nil
 			else
-				ValueText.Text = NewKey.Name
 				Config.Value = NewKey
 			end
+
+			UpdateText()
+			return Config
 		end
 
 		Keybind.Activated:Connect(function()
-			ValueText.Text = "..."
-
-			local NewKey = UserInputService.InputBegan:Wait()
-			if not UserInputService.WindowFocused then return end 
-
-			--// Reset back to previous if unknown
-			local Previous = Config.Value
-			if NewKey.KeyCode.Name == "Unknown" then
-				return Config:SetValue(Previous)
+			--// FIX: devices without a keyboard can't bind keys, so tapping fires the keybind instead
+			if not UserInputService.KeyboardEnabled then
+				return Callback(Config.Value)
 			end
 
-			wait(.1) --// 👍
-			Config:SetValue(NewKey.KeyCode)
+			if Listening then return end
+			Listening = true
+			ValueText.Text = "..."
+
+			local NewInput = UserInputService.InputBegan:Wait()
+			Listening = false
+
+			--// FIX: used to get stuck on "..." when cancelled/unfocused
+			if not UserInputService.WindowFocused or NewInput.UserInputType ~= Enum.UserInputType.Keyboard then
+				return UpdateText()
+			end
+
+			task.wait(.1) --// 👍
+			Config:SetValue(NewInput.KeyCode)
 		end)
 
 		Config.Connection = UserInputService.InputBegan:Connect(function(Input, GameProcessed)
+			if Listening then return end
 			if not Config.IgnoreGameProcessed and GameProcessed then return end
 			local KeyCode = Input.KeyCode
 			local Match = Config.Value
@@ -1062,7 +1926,15 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			return Callback(Input.KeyCode)
 		end)
 
+		--// Disconnect when the element is removed
+		Keybind.Destroying:Connect(function()
+			if Config.Connection then
+				Config.Connection:Disconnect()
+			end
+		end)
+
 		--// Update UI
+		Config.Value = nil
 		Config:SetValue(Key)
 
 		ObjectClass = self:NewInstance(Keybind, Config)
@@ -1123,10 +1995,13 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		end
 
 		local function ToggleOpen()
+			--// FIX: remember the state first, closing the dropdown can flip it (caused re-opening on touch)
+			local WasOpen = Config.Open
+
 			if Dropdown then
 				Dropdown:Close()
 			end
-			Config:SetOpen(not Config.Open)
+			Config:SetOpen(not WasOpen)
 		end
 
 		--// Connect events
@@ -1151,16 +2026,29 @@ function ImGui:Dropdown(Config)
 	local Selection: ScrollingFrame = Prefabs.Selection:Clone()
 	local UIStroke = Selection:FindFirstChildOfClass("UIStroke")
 
-	local Padding = UIStroke.Thickness*2
+	local Scale = self:GetScale()
+	local Padding = UIStroke and UIStroke.Thickness*2 or 2
 	local Position = Parent.AbsolutePosition
 	local Size = Parent.AbsoluteSize
 
 	Selection.Parent = self.ScreenGui
 	Selection.Position = UDim2.fromOffset(Position.X+Padding, Position.Y+Size.Y)
 
+	--// Match the window scale (touch devices)
+	self:CreateInstance("UIScale", Selection, {Scale = Scale})
+
+	local Closed = false
+
+	--// Mouse: close when clicking outside. Touch: close when tapping outside of the list and the combo
 	local Hover = self:ConnectHover({
 		Parent = Selection,
 		OnInput = function(MouseHovering, Input)
+			if Input.UserInputType == Touch then
+				if IsPointInside(Selection, Input.Position) then return end
+				if IsPointInside(Parent, Input.Position) then return end
+				return Config:Close()
+			end
+
 			if not Input.UserInputType.Name:find("Mouse") then return end
 
 			if not MouseHovering then
@@ -1170,13 +2058,17 @@ function ImGui:Dropdown(Config)
 	})
 
 	function Config:Close()
+		--// FIX: closing twice used to fire the callback twice
+		if Closed then return end
+		Closed = true
+
 		local CloseCallback = Config.Closed
 		if CloseCallback then
 			CloseCallback()
 		end
 
 		Hover:Disconnect()
-		Selection:Remove()
+		Selection:Destroy()
 	end
 
 	local function SetValue(Value)
@@ -1206,8 +2098,15 @@ function ImGui:Dropdown(Config)
 	-- Roblox does not support UISizeConstraint on a scrolling frame grr
 
 	local MaxSizeY = Config.MaxSizeY or 200
-	local YSize = math.clamp(Selection.AbsoluteCanvasSize.Y, Size.Y, MaxSizeY)
-	Selection.Size = UDim2.fromOffset(Size.X-Padding, YSize)
+	local YSize = math.clamp(Selection.AbsoluteCanvasSize.Y / Scale, Size.Y / Scale, MaxSizeY)
+	Selection.Size = UDim2.fromOffset((Size.X-Padding) / Scale, YSize)
+
+	--// Open upwards if there is no room below (small phone screens)
+	local Viewport = self:GetViewportSize()
+	local HeightPx = YSize * Scale
+	if Position.Y + Size.Y + HeightPx > Viewport.Y and Position.Y - HeightPx >= 0 then
+		Selection.Position = UDim2.fromOffset(Position.X+Padding, Position.Y-HeightPx)
+	end
 
 	return Config
 end
@@ -1251,6 +2150,16 @@ function ImGui:ApplyAnimations(Instance: GuiObject, Class: string, Target: GuiOb
 	--// Reset colors
 	if Connections["MouseLeave"] then
 		Connections["MouseLeave"]()
+
+		--// FIX: MouseLeave is unreliable for touches, reset the hover state when the finger lifts
+		if UserInputService.TouchEnabled then
+			local MouseLeave = Connections["MouseLeave"]
+			Instance.InputEnded:Connect(function(Input)
+				if Input.UserInputType == Touch then
+					MouseLeave()
+				end
+			end)
+		end
 	end
 
 	return Connections 
@@ -1262,7 +2171,7 @@ function ImGui:HeaderAnimate(Header: Instance, Animation, Open, TitleBar: Instan
 	--// Togle animation
 	ImGui:Tween(ToggleButtion, {
 		Rotation = Open and 90 or 0,
-	}):Play()
+	})
 
 	--// Container animation
 	local Container: Frame = Header:FindFirstChild("ChildContainer")
@@ -1270,7 +2179,9 @@ function ImGui:HeaderAnimate(Header: Instance, Animation, Open, TitleBar: Instan
 
 	local UIListLayout: UIListLayout = Container.UIListLayout
 	local UIPadding: UIPadding = Container:FindFirstChildOfClass("UIPadding")
-	local ContentSize = UIListLayout.AbsoluteContentSize
+
+	--// FIX: AbsoluteContentSize is in pixels, sizes are scaled by the window's UIScale
+	local ContentSize = UIListLayout.AbsoluteContentSize / ImGui:GetScale()
 
 	if UIPadding then
 		local Top = UIPadding.PaddingTop.Offset
@@ -1295,103 +2206,129 @@ function ImGui:HeaderAnimate(Header: Instance, Animation, Open, TitleBar: Instan
 	end)
 end
 
-function ImGui:ApplyDraggable(Frame: Frame, Header: Frame)
-	local tweenInfo = ImGui:GetAnimation(true)
-	local Header = Header or Frame
+--// Shared mouse + touch drag handling
+--// Config: Target (GuiObject that starts the drag), CanStart, Started(Input), Moved(Input, Delta), Ended(Input)
+function ImGui:ConnectDrag(Config)
+	local Target: GuiObject = Config.Target
+	local Active: InputObject? = nil
+	local StartPosition: Vector3? = nil
 
-	local Dragging = false
-	local KeyBeganPos = nil
-	local BeganPos = Frame.Position
+	local Connections = {}
 
-	--// Whitelist
-	local UserInputTypes = {
-		Enum.UserInputType.MouseButton1,
-		Enum.UserInputType.Touch
-	}
+	local function IsActiveMove(Input: InputObject)
+		if not Active then return false end
 
-	local function UserInputTypeAllowed(InputType: Enum.UserInputType)
-		return table.find(UserInputTypes, InputType)
+		--// Touch InputObjects are reused for the life of the touch
+		if Active.UserInputType == Touch then
+			return Input == Active or Input.UserInputType == Touch
+		end
+		return Input.UserInputType == MouseMovement
 	end
 
-	--// Debounce 
-	Header.InputBegan:Connect(function(Key)
-		if UserInputTypeAllowed(Key.UserInputType) then
-			Dragging = true
-			KeyBeganPos = Key.Position
-			BeganPos = Frame.Position
+	table.insert(Connections, Target.InputBegan:Connect(function(Input)
+		if Active or not IsPointerStart(Input) then return end
+		if Config.CanStart and not Config.CanStart(Input) then return end
+
+		Active = Input
+		StartPosition = Input.Position
+
+		if Config.Started then
+			Config.Started(Input)
 		end
-	end)
+	end))
 
-	UserInputService.InputEnded:Connect(function(Key)
-		if UserInputTypeAllowed(Key.UserInputType) then
-			Dragging = false
+	table.insert(Connections, UserInputService.InputChanged:Connect(function(Input)
+		if not IsActiveMove(Input) then return end
+		if Config.Moved then
+			Config.Moved(Input, Input.Position - StartPosition)
 		end
-	end)
+	end))
 
-	--// Dragging
-	local function Movement(Input)
-		if not Dragging then return end
+	table.insert(Connections, UserInputService.InputEnded:Connect(function(Input)
+		if not Active then return end
+		if Input ~= Active and Input.UserInputType ~= Active.UserInputType then return end
 
-		local Delta = Input.Position - KeyBeganPos
-		local Position = UDim2.new(
-			BeganPos.X.Scale, 
-			BeganPos.X.Offset + Delta.X, 
-			BeganPos.Y.Scale, 
-			BeganPos.Y.Offset + Delta.Y
-		)
+		Active = nil
+		if Config.Ended then
+			Config.Ended(Input)
+		end
+	end))
 
-		ImGui:Tween(Frame, {
-			Position = Position
-		}):Play()
+	function Config:Disconnect()
+		for _, Connection in next, Connections do
+			Connection:Disconnect()
+		end
 	end
 
-	--// Connect movement events
-	UserInputService.TouchMoved:Connect(Movement)
-	UserInputService.InputChanged:Connect(function(Input)
-		if Input.UserInputType == Enum.UserInputType.MouseMovement then 
-			return Movement(Input)
-		end
-	end)
+	--// FIX: global connections used to leak after a widget/window was destroyed
+	table.insert(Connections, Target.Destroying:Connect(function()
+		Config:Disconnect()
+	end))
+
+	return Config
 end
 
+function ImGui:ApplyDraggable(Frame: Frame, Header: Frame)
+	local Header = Header or Frame
+	local BeganPos = Frame.Position
+
+	return self:ConnectDrag({
+		Target = Header,
+		Started = function()
+			BeganPos = Frame.Position
+		end,
+		Moved = function(Input, Delta)
+			--// Set directly instead of tweening, much smoother on touch screens
+			Frame.Position = UDim2.new(
+				BeganPos.X.Scale, 
+				BeganPos.X.Offset + Delta.X, 
+				BeganPos.Y.Scale, 
+				BeganPos.Y.Offset + Delta.Y
+			)
+		end,
+		Ended = function()
+			ImGui:ClampWindowPosition(Frame)
+		end
+	})
+end
 
 function ImGui:ApplyResizable(MinSize, Frame: Frame, Dragger: TextButton, Config)
-	local DragStart
-	local OrignialSize
+	local OrignialSize = Frame.AbsoluteSize
 
 	MinSize = MinSize or Vector2.new(160, 90)
 
-	Dragger.MouseButton1Down:Connect(function()
-		if DragStart then return end
-		OrignialSize = Frame.AbsoluteSize			
-		DragStart = Vector2.new(Mouse.X, Mouse.Y)
-	end)	
+	return self:ConnectDrag({
+		Target = Dragger,
+		Started = function()
+			OrignialSize = Frame.AbsoluteSize
+		end,
+		Moved = function(Input, Delta)
+			local Scale = ImGui:GetScale()
+			local Viewport = ImGui:GetViewportSize()
 
-	UserInputService.InputChanged:Connect(function(Input)
-		if not DragStart or Input.UserInputType ~= Enum.UserInputType.MouseMovement then 
-			return
+			--// Pixels -> local units (the window may be scaled)
+			local NewX = (OrignialSize.X + Delta.X) / Scale
+			local NewY = (OrignialSize.Y + Delta.Y) / Scale
+
+			if ImGui.ClampToScreen then
+				NewX = math.min(NewX, Viewport.X / Scale)
+				NewY = math.min(NewY, Viewport.Y / Scale)
+			end
+
+			local NewSize = UDim2.fromOffset(
+				math.max(MinSize.X, NewX), 
+				math.max(MinSize.Y, NewY)
+			)
+
+			Frame.Size = NewSize
+			if Config then
+				Config.Size = NewSize
+			end
+		end,
+		Ended = function()
+			ImGui:ClampWindowPosition(Frame)
 		end
-
-		local MousePos = Vector2.new(Mouse.X, Mouse.Y)
-		local mouseMoved = MousePos - DragStart
-
-		local NewSize = OrignialSize + mouseMoved
-		NewSize = UDim2.fromOffset(
-			math.max(MinSize.X, NewSize.X), 
-			math.max(MinSize.Y, NewSize.Y)
-		)
-
-		Frame.Size = NewSize
-		if Config then
-			Config.Size = NewSize
-		end
-	end)
-
-	UserInputService.InputEnded:Connect(function(Input)
-		if Input.UserInputType == Enum.UserInputType.MouseButton1 then
-			DragStart = nil
-		end
-	end)	
+	})
 end
 
 function ImGui:ConnectHover(Config)
@@ -1419,6 +2356,11 @@ function ImGui:ConnectHover(Config)
 		end
 	end
 
+	--// Clean up with the instance
+	table.insert(Connections, Parent.Destroying:Connect(function()
+		Config:Disconnect()
+	end))
+
 	return Config
 end
 
@@ -1437,16 +2379,20 @@ function ImGui:ApplyWindowSelectEffect(Window: GuiObject, TitleBar)
 	local function SetSelected(Selected)
 		local Animations = ImGui.Animations
 		local Type = Selected and "Selected" or "Deselected"
-		local TweenInfo = ImGui:GetAnimation(true) 
 
 		ImGui:Tween(TitleBar, Colors[Type])
-		ImGui:Tween(UIStroke, Animations.WindowBorder[Type])
+		if UIStroke then
+			ImGui:Tween(UIStroke, Animations.WindowBorder[Type])
+		end
 	end
 
 	self:ConnectHover({
 		Parent = Window,
 		OnInput = function(MouseHovering, Input)
-			if Input.UserInputType.Name:find("Mouse") then
+			--// FIX: touch screens have no hover, select the window by tapping inside it
+			if Input.UserInputType == Touch then
+				SetSelected(IsPointInside(Window, Input.Position))
+			elseif Input.UserInputType.Name:find("Mouse") then
 				SetSelected(MouseHovering)
 			end
 		end,
@@ -1454,6 +2400,8 @@ function ImGui:ApplyWindowSelectEffect(Window: GuiObject, TitleBar)
 end
 
 function ImGui:SetWindowProps(Properties, IgnoreWindows)
+	IgnoreWindows = IgnoreWindows or {}
+
 	local Module = {
 		OldProperties = {}
 	}
@@ -1486,12 +2434,23 @@ function ImGui:SetWindowProps(Properties, IgnoreWindows)
 	return Module
 end
 
+function ImGui:ToLocal(Pixels: number): number
+	return Pixels / self:GetScale()
+end
+
 function ImGui:CreateWindow(WindowConfig)
+	WindowConfig = WindowConfig or {}
+
 	--// Create Window frame
 	local Window: Frame = Prefabs.Window:Clone()
 	Window.Parent = ImGui.ScreenGui
 	Window.Visible = true
 	WindowConfig.Window = Window
+
+	--// Scale (bigger UI on touch screens)
+	ImGui:CreateInstance("UIScale", Window, {
+		Scale = ImGui:GetScale()
+	})
 
 	local Content = Window.Content
 	local Body = Content.Body
@@ -1519,8 +2478,13 @@ function ImGui:CreateWindow(WindowConfig)
 	local ToolBar = Content.ToolBar
 	ToolBar.Visible = WindowConfig.TabsBar ~= false
 
+	--// FIX: windows used to drag from anywhere, which made touch scrolling and sliders drag the window
 	if not WindowConfig.NoDrag then
-		ImGui:ApplyDraggable(Window)
+		local DragHandle = TitleBar
+		if WindowConfig.NoTitleBar or WindowConfig.DragAnywhere then
+			DragHandle = Window
+		end
+		ImGui:ApplyDraggable(Window, DragHandle)
 	end
 
 	--// Close Window 
@@ -1538,9 +2502,10 @@ function ImGui:CreateWindow(WindowConfig)
 	CloseButton.Activated:Connect(WindowConfig.Close)
 
 	function WindowConfig:GetHeaderSizeY(): number
+		--// Pixels -> local units
 		local ToolbarY = ToolBar.Visible and ToolBar.AbsoluteSize.Y or 0
 		local TitlebarY = TitleBar.Visible and TitleBar.AbsoluteSize.Y or 0
-		return ToolbarY + TitlebarY
+		return ImGui:ToLocal(ToolbarY + TitlebarY)
 	end
 
 	function WindowConfig:UpdateBody()
@@ -1564,7 +2529,10 @@ function ImGui:CreateWindow(WindowConfig)
 			Interactable = Open
 		}, nil, NoAnimation)
 		ImGui:Tween(Window, {
-			Size = Open and self.Size or UDim2.fromOffset(WindowAbSize.X, TitleBarSize.Y)
+			Size = Open and (self.Size or Window.Size) or UDim2.fromOffset(
+				ImGui:ToLocal(WindowAbSize.X), 
+				ImGui:ToLocal(TitleBarSize.Y)
+			)
 		}, nil, NoAnimation)
 		ImGui:Tween(Body, {
 			Visible = Open
@@ -1582,7 +2550,7 @@ function ImGui:CreateWindow(WindowConfig)
 		return self
 	end
 	function WindowConfig:Remove()
-		Window:Remove()
+		Window:Destroy()
 		return self
 	end
 
@@ -1648,7 +2616,8 @@ function ImGui:CreateWindow(WindowConfig)
 		local HeaderSizeY = self:GetHeaderSizeY()
 
 		if typeof(Size) == "Vector2" then
-			Size = UDim2.fromOffset(Size.X, Size.Y)
+			--// Pixels -> local units (Vector2 sizes come from AbsoluteSize)
+			Size = UDim2.fromOffset(ImGui:ToLocal(Size.X), ImGui:ToLocal(Size.Y))
 		end
 
 		--// Apply new size
@@ -1658,6 +2627,8 @@ function ImGui:CreateWindow(WindowConfig)
 			Size.Y.Scale,
 			Size.Y.Offset + HeaderSizeY
 		)
+		NewSize = ImGui:ClampSizeToScreen(NewSize)
+
 		self.Size = NewSize
 		Window.Size = NewSize
 
@@ -1699,8 +2670,26 @@ function ImGui:CreateWindow(WindowConfig)
 		WindowConfig:SetOpen(WindowConfig.Open or true, true)
 	end
 
+	--// Keep the window on screen
+	if typeof(WindowConfig.Size) == "UDim2" then
+		WindowConfig.Size = ImGui:ClampSizeToScreen(WindowConfig.Size)
+	end
+
 	ImGui.Windows[Window] = WindowConfig
+	Window.Destroying:Connect(function()
+		ImGui.Windows[Window] = nil
+	end)
+
 	ImGui:CheckStyles(Window, WindowConfig, WindowConfig.Colors)
+
+	--// FIX: collapsing a window used to error when no Size was given
+	if typeof(WindowConfig.Size) ~= "UDim2" then
+		WindowConfig.Size = Window.Size
+	end
+
+	task.defer(function()
+		ImGui:ClampWindowPosition(Window)
+	end)
 
 	--// Window section events
 	if not WindowConfig.NoSelectEffect then
@@ -1751,7 +2740,7 @@ function ImGui:CreateModal(Config)
 			BackgroundTransparency = 1
 		})
 		Tween.Completed:Connect(function()
-			ModalEffect:Remove()
+			ModalEffect:Destroy()
 		end)
 
 		WindowManger:Revert()
@@ -1761,12 +2750,38 @@ function ImGui:CreateModal(Config)
 	return Config
 end
 
-local GuiParent = IsStudio and PlayerGui or CoreGui
-ImGui.ScreenGui = ImGui:CreateInstance("ScreenGui", GuiParent, {
+--// ScreenGuis
+--// FIX: CoreGui isn't always accessible (some mobile executors), try gethui() -> CoreGui -> PlayerGui
+local function CreateGui(Properties)
+	local Gui = ImGui:CreateInstance("ScreenGui", nil, Properties)
+
+	if not IsStudio then
+		local Parents = {
+			function() return gethui and gethui() end,
+			function() return CoreGui end
+		}
+
+		for _, GetParent in Parents do
+			local Success, Parent = pcall(GetParent)
+			if Success and typeof(Parent) == "Instance" then
+				if pcall(function() Gui.Parent = Parent end) and Gui.Parent == Parent then
+					return Gui
+				end
+			end
+		end
+	end
+
+	Gui.Parent = PlayerGui
+	return Gui
+end
+
+ImGui.ScreenGui = CreateGui({
+	Name = "DepsoImGui",
 	DisplayOrder = 9999,
 	ResetOnSpawn = false
 })
-ImGui.FullScreenGui = ImGui:CreateInstance("ScreenGui", GuiParent, {
+ImGui.FullScreenGui = CreateGui({
+	Name = "DepsoImGuiFullscreen",
 	DisplayOrder = 99999,
 	ResetOnSpawn = false,
 	ScreenInsets = Enum.ScreenInsets.None

@@ -1,4 +1,1 @@
-- credit to depthso
-
-  
-**Mobile Support Imgui**
+- credit to https://github.com/depthso

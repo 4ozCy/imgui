@@ -8,6 +8,18 @@
 --//  * Touch / mobile support (drag, resize, sliders, dropdowns, keybinds, window focus)
 --//  * Optional UIScale for touch-only devices + windows are kept on screen
 --//  * Bug fixes (see the notes next to each change marked with "FIX")
+--//  * New: ImGui:Notify, :ColorPicker, :ConfigManager, Flags + SaveConfig/LoadConfig,
+--//         floating open/close button on mobile, Slider `Increment`, InputText `Finished`,
+--//         window `ToggleKey`, active tab indicator, screen rotation handling, ImGui:Destroy()
+--//
+--// Quick start:
+--//   local Window = ImGui:CreateWindow({Title = "Hub", Size = UDim2.fromOffset(380, 300), ToggleKey = Enum.KeyCode.RightControl})
+--//   local Tab = Window:CreateTab({Name = "Main"})
+--//   Tab:Checkbox({Label = "ESP", Flag = "ESP", Callback = function(_, v) print(v) end})
+--//   Tab:Slider({Label = "Speed", MinValue = 0, MaxValue = 5, Increment = 0.1, Flag = "Speed"})
+--//   Tab:ColorPicker({Label = "Color", Value = Color3.new(1, 0, 0), Flag = "Color"})
+--//   Tab:ConfigManager()
+--//   ImGui:Notify({Title = "Loaded", Text = "Hello!", Type = "Success"})
 
 local ImGui = {
 	Animations = {
@@ -54,8 +66,28 @@ local ImGui = {
 	--// Mobile / touch
 	TouchScale = 1.2, --// Window scale used on touch-only devices (set to 1 to disable)
 	Scale = 1,
-	ClampToScreen = true --// Keep windows inside the screen
+	ClampToScreen = true, --// Keep windows inside the screen
+
+	--// Features
+	ConfigFolder = "ImGuiConfigs",
+	AnimationsEnabled = true, --// ImGui:SetAnimations(false) skips every tween (faster on low-end phones)
+	NotifyDuration = 4,
+	FlagObjects = {}
 }
+
+--// Flags: ImGui.Flags["Name"] reads the live value of any widget created with `Flag = "Name"`
+ImGui.Flags = setmetatable({}, {
+	__index = function(_, Flag)
+		local Object = ImGui.FlagObjects[Flag]
+		return Object and Object.Config.Value
+	end,
+	__newindex = function(_, Flag, Value)
+		local Object = ImGui.FlagObjects[Flag]
+		if Object then
+			Object.Set(Value)
+		end
+	end
+})
 
 
 --// Universal functions
@@ -148,8 +180,11 @@ function ImGui:ClampWindowPosition(Window: GuiObject)
 	local Size = Window.AbsoluteSize
 	local Keep = 48 --// Pixels that must stay visible
 
-	local TargetX = math.clamp(Pos.X, Keep - Size.X, Viewport.X - Keep)
-	local TargetY = math.clamp(Pos.Y, 0, Viewport.Y - Keep)
+	--// FIX: math.clamp errors when min > max (tiny / not yet laid out viewports)
+	local MinX = Keep - Size.X
+	local MaxX = math.max(MinX, Viewport.X - Keep)
+	local TargetX = math.clamp(Pos.X, MinX, MaxX)
+	local TargetY = math.clamp(Pos.Y, 0, math.max(0, Viewport.Y - Keep))
 	local DeltaX, DeltaY = TargetX - Pos.X, TargetY - Pos.Y
 	if DeltaX == 0 and DeltaY == 0 then return end
 
@@ -158,6 +193,11 @@ function ImGui:ClampWindowPosition(Window: GuiObject)
 		Current.X.Scale, Current.X.Offset + DeltaX,
 		Current.Y.Scale, Current.Y.Offset + DeltaY
 	)
+end
+
+function ImGui:SetAnimations(Enabled: boolean)
+	self.AnimationsEnabled = Enabled ~= false
+	return self
 end
 
 function ImGui:SetScale(Scale: number)
@@ -171,6 +211,361 @@ function ImGui:SetScale(Scale: number)
 		end
 	end
 	return self
+end
+
+--// Flags / configs
+function ImGui:RegisterFlag(Config, Type: string, Set)
+	local Flag = Config.Flag
+	if not Flag then return end
+
+	self.FlagObjects[Flag] = {
+		Type = Type,
+		Set = Set,
+		Config = Config
+	}
+end
+
+local function EncodeValue(Value)
+	local Type = typeof(Value)
+
+	if Type == "Color3" then
+		return {__type = "Color3", R = Value.R, G = Value.G, B = Value.B}
+	elseif Type == "EnumItem" then
+		return {__type = "EnumItem", Enum = tostring(Value.EnumType), Name = Value.Name}
+	elseif Type == "boolean" or Type == "number" or Type == "string" then
+		return Value
+	end
+	return nil
+end
+
+local function DecodeValue(Value)
+	if typeof(Value) ~= "table" then
+		return Value
+	end
+
+	if Value.__type == "Color3" then
+		return Color3.new(Value.R, Value.G, Value.B)
+	elseif Value.__type == "EnumItem" then
+		local Success, Item = pcall(function()
+			return Enum[Value.Enum][Value.Name]
+		end)
+		return Success and Item or nil
+	end
+	return nil
+end
+
+function ImGui:ExportConfig(): string
+	local Data = {}
+	for Flag, Object in next, self.FlagObjects do
+		local Encoded = EncodeValue(Object.Config.Value)
+		if Encoded ~= nil then
+			Data[Flag] = Encoded
+		end
+	end
+	return GetService("HttpService"):JSONEncode(Data)
+end
+
+function ImGui:ImportConfig(Json: string): number
+	local Data = GetService("HttpService"):JSONDecode(Json)
+	local Applied = 0
+
+	for Flag, Raw in next, Data do
+		local Object = self.FlagObjects[Flag]
+		local Value = DecodeValue(Raw)
+		if Object and Value ~= nil then
+			if pcall(Object.Set, Value) then
+				Applied += 1
+			end
+		end
+	end
+	return Applied
+end
+
+function ImGui:GetConfigPath(Name: string): string
+	return `{self.ConfigFolder}/{Name}.json`
+end
+
+function ImGui:SaveConfig(Name: string)
+	if not writefile then return false, "This executor does not support writefile" end
+	if typeof(Name) ~= "string" or Name == "" then return false, "Enter a config name" end
+
+	return pcall(function()
+		if makefolder and isfolder and not isfolder(self.ConfigFolder) then
+			makefolder(self.ConfigFolder)
+		end
+		writefile(self:GetConfigPath(Name), self:ExportConfig())
+	end)
+end
+
+function ImGui:LoadConfig(Name: string)
+	if not (readfile and isfile) then return false, "This executor does not support readfile" end
+	if typeof(Name) ~= "string" or Name == "" then return false, "Pick a config" end
+
+	local Path = self:GetConfigPath(Name)
+	if not isfile(Path) then return false, "Config not found" end
+
+	return pcall(function()
+		return self:ImportConfig(readfile(Path))
+	end)
+end
+
+function ImGui:DeleteConfig(Name: string)
+	if not (delfile and isfile) then return false, "This executor does not support delfile" end
+
+	local Path = self:GetConfigPath(Name)
+	if not isfile(Path) then return false, "Config not found" end
+	return pcall(delfile, Path)
+end
+
+function ImGui:GetConfigs()
+	local List = {}
+	if not (listfiles and isfolder) or not isfolder(self.ConfigFolder) then
+		return List
+	end
+
+	pcall(function()
+		for _, File in listfiles(self.ConfigFolder) do
+			local Name = File:match("([^/\\]+)%.json$")
+			if Name then
+				table.insert(List, Name)
+			end
+		end
+	end)
+
+	table.sort(List)
+	return List
+end
+
+--// Notifications (toasts)
+local NotifyColors = {
+	Info = Color3.fromRGB(66, 150, 250),
+	Success = Color3.fromRGB(80, 200, 120),
+	Warning = Color3.fromRGB(240, 180, 60),
+	Error = Color3.fromRGB(230, 80, 80)
+}
+
+function ImGui:Notify(Config)
+	if typeof(Config) == "string" then
+		Config = {Text = Config}
+	end
+	Config = Config or {}
+
+	local Scale = self:GetScale()
+	local Viewport = self:GetViewportSize()
+	local Accent = NotifyColors[Config.Type or "Info"] or NotifyColors.Info
+	local Duration = Config.Duration or self.NotifyDuration
+
+	--// Holder (top right, below the safe area)
+	local Holder = self.NotifyHolder
+	if not Holder or not Holder.Parent then
+		Holder = self:CreateInstance("Frame", self.ScreenGui, {
+			Name = "Notifications",
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -8, 0, 8),
+			Size = UDim2.fromOffset(260, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ZIndex = 100
+		})
+		self:CreateInstance("UIListLayout", Holder, {
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0, 6),
+			HorizontalAlignment = Enum.HorizontalAlignment.Right
+		})
+		self:CreateInstance("UIScale", Holder, {Scale = Scale})
+		self.NotifyHolder = Holder
+		self.Notifications = {}
+	end
+
+	Holder.Size = UDim2.fromOffset(math.min(260, math.floor(Viewport.X * 0.92 / Scale)), 0)
+	local HolderScale = Holder:FindFirstChildOfClass("UIScale")
+	if HolderScale then
+		HolderScale.Scale = Scale
+	end
+
+	--// Keep the stack short
+	while #self.Notifications >= 5 do
+		self.Notifications[1]:Close()
+	end
+
+	--// Toast (a button so it can be dismissed with a tap)
+	self.NotifyOrder = (self.NotifyOrder or 0) + 1
+	local Toast = self:CreateInstance("TextButton", Holder, {
+		Name = "Toast",
+		LayoutOrder = self.NotifyOrder,
+		Size = UDim2.fromScale(1, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = Color3.fromRGB(15, 15, 15),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Text = "",
+		ClipsDescendants = true
+	})
+	self:CreateInstance("UICorner", Toast, {CornerRadius = UDim.new(0, 4)})
+	local Stroke = self:CreateInstance("UIStroke", Toast, {
+		Color = Accent,
+		Transparency = 0.2,
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	})
+	self:CreateInstance("UIPadding", Toast, {
+		PaddingLeft = UDim.new(0, 10),
+		PaddingRight = UDim.new(0, 10),
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8)
+	})
+	self:CreateInstance("UIListLayout", Toast, {
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 2)
+	})
+
+	local Labels = {}
+	local function AddLabel(Text: string, Color: Color3, Order: number)
+		local Label = self:CreateInstance("TextLabel", Toast, {
+			Name = "Label",
+			LayoutOrder = Order,
+			Size = UDim2.fromScale(1, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Font = Enum.Font.Code,
+			TextSize = 14,
+			TextColor3 = Color,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = Text
+		})
+		table.insert(Labels, Label)
+	end
+
+	if Config.Title then
+		AddLabel(tostring(Config.Title), Accent, 1)
+	end
+	if Config.Text then
+		AddLabel(tostring(Config.Text), Color3.fromRGB(235, 235, 235), 2)
+	end
+
+	--// Fade in
+	self:Tween(Toast, {BackgroundTransparency = 0.05})
+
+	local Closed = false
+	function Config:Close()
+		if Closed then return end
+		Closed = true
+
+		local Index = table.find(ImGui.Notifications, Config)
+		if Index then
+			table.remove(ImGui.Notifications, Index)
+		end
+
+		ImGui:Tween(Toast, {BackgroundTransparency = 1})
+		ImGui:Tween(Stroke, {Transparency = 1})
+		for _, Label in Labels do
+			ImGui:Tween(Label, {TextTransparency = 1})
+		end
+
+		task.delay(0.15, function()
+			Toast:Destroy()
+		end)
+	end
+
+	Toast.Activated:Connect(function()
+		Config:Close()
+	end)
+
+	table.insert(self.Notifications, Config)
+	if Duration and Duration > 0 then
+		task.delay(Duration, function()
+			Config:Close()
+		end)
+	end
+
+	return Config
+end
+
+--// Floating open/close button (touch devices have no toggle key)
+function ImGui:CreateMobileButton(WindowConfig, Config)
+	Config = Config or {}
+	local Window: Frame = WindowConfig.Window
+
+	self.MobileButtons = (self.MobileButtons or 0) + 1
+	local Index = self.MobileButtons - 1
+
+	local Button = self:CreateInstance("TextButton", self.ScreenGui, {
+		Name = "MobileToggle",
+		Text = Config.Text or WindowConfig.MobileButtonText or "UI",
+		Font = Enum.Font.Code,
+		TextSize = 14,
+		TextColor3 = Color3.fromRGB(255, 255, 255),
+		AutoButtonColor = false,
+		Size = UDim2.fromOffset(44, 44),
+		Position = Config.Position or UDim2.new(0, 10, 0.35, Index * 50),
+		BackgroundColor3 = Color3.fromRGB(41, 74, 122),
+		BackgroundTransparency = 0.15,
+		BorderSizePixel = 0,
+		ZIndex = 200
+	})
+	self:CreateInstance("UICorner", Button, {CornerRadius = UDim.new(1, 0)})
+	self:CreateInstance("UIStroke", Button, {
+		Color = Color3.fromRGB(110, 110, 128),
+		Transparency = 0.4,
+		Thickness = 1
+	})
+	self:CreateInstance("UIScale", Button, {Scale = self:GetScale()})
+
+	--// Draggable, but a tap still toggles the window
+	local Dragged = 0
+	local StartPosition = Button.Position
+
+	self:ConnectDrag({
+		Target = Button,
+		Started = function()
+			Dragged = 0
+			StartPosition = Button.Position
+		end,
+		Moved = function(Input, Delta)
+			Dragged = math.max(Dragged, math.abs(Delta.X) + math.abs(Delta.Y))
+			if Dragged <= 8 then return end
+
+			Button.Position = UDim2.new(
+				StartPosition.X.Scale, StartPosition.X.Offset + Delta.X,
+				StartPosition.Y.Scale, StartPosition.Y.Offset + Delta.Y
+			)
+		end,
+		Ended = function()
+			ImGui:ClampWindowPosition(Button)
+		end
+	})
+
+	Button.Activated:Connect(function()
+		if Dragged > 8 then return end
+		WindowConfig:SetVisible(not Window.Visible)
+	end)
+
+	Window.Destroying:Connect(function()
+		Button:Destroy()
+	end)
+
+	return Button
+end
+
+function ImGui:Destroy()
+	for Window in next, self.Windows do
+		pcall(function()
+			Window:Destroy()
+		end)
+	end
+
+	if self.NotifyHolder then
+		self.NotifyHolder:Destroy()
+		self.NotifyHolder = nil
+	end
+
+	self.ScreenGui:Destroy()
+	self.FullScreenGui:Destroy()
+	table.clear(self.FlagObjects)
 end
 
 --// Built-in prefabs 
@@ -1052,6 +1447,13 @@ function ImGui:ApplyColors(ColorOverwrites, GuiObject: GuiObject, ElementType: s
 	end
 end
 
+--// PERF: CheckStyles tries to apply every config key as a property. Keys like Callback/Label/Items are not
+--// properties, so every widget used to throw and swallow several errors. Remember the keys that don't exist.
+local InvalidProperties = {}
+local function SetProperty(GuiObject: GuiObject, Key: string, Value)
+	GuiObject[Key] = Value
+end
+
 function ImGui:CheckStyles(GuiObject: GuiObject, Class, Colors)
 	--// Addional styles
 	for Info, Callback in next, AddionalStyles do
@@ -1088,29 +1490,58 @@ function ImGui:CheckStyles(GuiObject: GuiObject, Class, Colors)
 	end
 
 	--// Set properties
+	local ClassName = GuiObject.ClassName
+	local Invalid = InvalidProperties[ClassName]
+	if not Invalid then
+		Invalid = {}
+		InvalidProperties[ClassName] = Invalid
+	end
+
 	for Key, Value in next, Class do
-		pcall(function() --// If the property does not exist
-			GuiObject[Key] = Value
-		end)
+		if Invalid[Key] then continue end
+
+		--// Functions and tables can never be Roblox properties
+		local ValueType = typeof(Value)
+		if ValueType == "function" or ValueType == "table" then continue end
+
+		local Success, Error = pcall(SetProperty, GuiObject, Key, Value)
+
+		--// Only remember "doesn't exist", a wrong value type must not blacklist a real property
+		if not Success and tostring(Error):find("is not a valid member", 1, true) then
+			Invalid[Key] = true
+		end
 	end
 end
 
 function ImGui:MergeMetatables(Class, Instance: GuiObject)
 	local Metadata = {}
+	local ClassOnly = {} --// Keys that don't exist on the instance (e.g. :Button(), :Slider())
+
+	local function GetProperty(Instance: GuiObject, Key: string)
+		return Instance[Key]
+	end
+
 	Metadata.__index = function(self, Key)
-		local Success, Value = pcall(function()
-			local Value = Instance[Key]
+		--// PERF: method calls like Header:Button() used to throw "not a valid member" on every call
+		if ClassOnly[Key] then
+			return Class[Key]
+		end
+
+		--// PERF: static function, no closure is created per access
+		local Success, Value = pcall(GetProperty, Instance, Key)
+
+		--// FIX: properties that are `false` (e.g. Visible) used to fall through to the class table
+		if Success and Value ~= nil then
 			if typeof(Value) == "function" then
 				return function(...)
 					return Value(Instance, ...)
 				end
 			end
 			return Value
-		end)
+		end
 
-		--// FIX: properties that are `false` (e.g. Visible) used to fall through to the class table
-		if Success and Value ~= nil then
-			return Value
+		if not Success and Class[Key] ~= nil and tostring(Value):find("is not a valid member", 1, true) then
+			ClassOnly[Key] = true
 		end
 		return Class[Key]
 	end
@@ -1267,6 +1698,10 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		end
 		Config:SetTicked(Value, true)
 
+		ImGui:RegisterFlag(Config, "Checkbox", function(NewValue)
+			Config:SetTicked(NewValue == true)
+		end)
+
 		function Config:Toggle()
 			Config:SetTicked(not Value)
 			return Config
@@ -1368,6 +1803,18 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			return Config
 		end
 
+		--// Fires when the box loses focus (Enter pressed or tapped away)
+		TextBox.FocusLost:Connect(function(EnterPressed)
+			local Finished = Config.Finished
+			if Finished then
+				Finished(ObjectClass, TextBox.Text, EnterPressed)
+			end
+		end)
+
+		ImGui:RegisterFlag(Config, "InputText", function(NewValue)
+			Config:SetValue(NewValue)
+		end)
+
 		return ObjectClass
 	end
 
@@ -1417,17 +1864,25 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			return Config.Enabled ~= false
 		end
 
+		local LastLineCount = 0
 		function Config:UpdateLineNumbers()
 			if not Config.LineNumbers then return end
 
-			local LinesCount = #Source.Text:split("\n")
-			local Format = Config.LinesFormat or "%s"
+			--// PERF: count line breaks without building a table of lines
+			local _, Breaks = Source.Text:gsub("\n", "")
+			local LinesCount = Breaks + 1
 
-			--// Update lines text
-			Lines.Text = ""
+			--// PERF: nothing to rebuild when the amount of lines did not change
+			if LinesCount == LastLineCount then return Config end
+			LastLineCount = LinesCount
+
+			--// PERF: one concat instead of a string append per line (was O(n^2))
+			local Format = Config.LinesFormat or "%s"
+			local Parts = table.create(LinesCount)
 			for i = 1, LinesCount do
-				Lines.Text ..= `{Format:format(i)}{i ~= LinesCount and '\n' or ''}`
+				Parts[i] = Format:format(i)
 			end
+			Lines.Text = table.concat(Parts, "\n")
 
 			Source.Size = UDim2.new(1, -Lines.AbsoluteSize.X, 0, 0)
 			return Config
@@ -1462,22 +1917,25 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			local MaxLines = Config.MaxLines or 100
 			local NewString = "\n" .. ImGui:Concat({...}, " ") 
 
-			Source.Text ..= NewString
+			--// PERF: trim first and assign the text once (used to assign, split everything, then assign again)
+			local NewText = Source.Text .. NewString
+			local _, Breaks = NewText:gsub("\n", "")
+			if Breaks + 1 > MaxLines then
+				local FirstBreak = NewText:find("\n", 1, true)
+				NewText = NewText:sub(FirstBreak + 1)
+			end
+			Source.Text = NewText
 			Config:UpdateLineNumbers()
 
 			if Config.AutoScroll then
 				Config:UpdateScroll()
 			end
-
-			local Lines = Source.Text:split("\n")
-			if #Lines > MaxLines then
-				Source.Text = Source.Text:sub(#Lines[1]+2)
-			end
 			return Config
 		end
 
 		--// Connect events
-		Source.Changed:Connect(function()
+		--// PERF: `Changed` fired for every property (Position, Size, ...), only the text matters
+		Source:GetPropertyChangedSignal("Text"):Connect(function()
 			Config:UpdateLineNumbers()
 		end)
 
@@ -1701,6 +2159,12 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		local Value = Config.Value or Config.MinValue
 		local ValueFormat = Config.Format or "%.d"
 		local IsProgress = Config.Progress
+
+		--// Decimals follow the Increment (0.1 -> "%.1f")
+		if not Config.Format and Config.Increment and Config.Increment % 1 ~= 0 then
+			local Decimals = #(tostring(Config.Increment):match("%.(%d+)") or "")
+			ValueFormat = ("%%.%df"):format(math.clamp(Decimals, 1, 4))
+		end
 		Config.Name = Config.Label or ""
 
 		--// Slider element
@@ -1735,7 +2199,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			Label.Position = UDim2.new(1, 15-Diff.Offset, 0, 0)
 		end
 
-		function Config:SetValue(Value: number, Slider: false)
+		function Config:SetValue(Value: number, Slider: false, Instant: boolean?)
 			local MinValue = Config.MinValue
 			local MaxValue = Config.MaxValue
 			local Difference = MaxValue - MinValue
@@ -1748,6 +2212,15 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			else
 				Percentage = Value
 				Value = MinValue + (Difference * Percentage)
+			end
+
+			--// Snap to Increment
+			local Increment = Config.Increment
+			if Increment and Increment > 0 then
+				Value = MinValue + math.floor((Value - MinValue) / Increment + 0.5) * Increment
+				Value = math.floor(Value * 1e6 + 0.5) / 1e6
+				Value = math.clamp(Value, math.min(MinValue, MaxValue), math.max(MinValue, MaxValue))
+				Percentage = Difference ~= 0 and (Value - MinValue) / Difference or 0
 			end
 
 			Percentage = math.clamp(Percentage, 0, 1)
@@ -1764,7 +2237,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			end
 
 			--// Animate
-			ImGui:Tween(Grab, Props)
+			ImGui:Tween(Grab, Props, nil, Instant) --// PERF: no tween per input event while dragging
 
 			--// Update UI
 			Config.Value = Value
@@ -1790,7 +2263,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			local Left = Slider.AbsolutePosition.X + PadLeft
 			local Span = math.max(Width - PadLeft - PadRight, 1)
 
-			Config:SetValue(math.clamp((X - Left) / Span, 0, 1), true)
+			Config:SetValue(math.clamp((X - Left) / Span, 0, 1), true, true)
 		end
 
 		--// FIX: mouse + touch dragging (used Mouse.Move / GetMouseLocation which don't work on mobile)
@@ -1828,8 +2301,12 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			end
 		})
 
-		--// Update UI
-		Config:SetValue(Value)
+		--// Update UI (instant, no tween needed for the starting value)
+		Config:SetValue(Value, nil, true)
+
+		ImGui:RegisterFlag(Config, "Slider", function(NewValue)
+			Config:SetValue(NewValue)
+		end)
 
 		return ObjectClass
 	end
@@ -1937,6 +2414,10 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 		Config.Value = nil
 		Config:SetValue(Key)
 
+		ImGui:RegisterFlag(Config, "Keybind", function(NewValue)
+			Config:SetValue(NewValue)
+		end)
+
 		ObjectClass = self:NewInstance(Keybind, Config)
 		return ObjectClass
 	end
@@ -2013,7 +2494,211 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			Config:SetValue(Config.Selected)
 		end
 
+		ImGui:RegisterFlag(Config, "Combo", function(NewValue)
+			Config:SetValue(NewValue)
+		end)
+
 		return ObjectClass 
+	end
+
+	function ContainerClass:ColorPicker(Config)
+		Config = Config or {}
+		local Value: Color3 = Config.Value or Color3.fromRGB(255, 255, 255)
+		Config.Value = Value
+		Config.Title = Config.Label or Config.Title or "Color"
+		Config.Open = Config.Open or false
+
+		local Ready = false
+		local Busy = false
+		local H, S, V = Value:ToHSV()
+
+		local Header = self:CollapsingHeader(Config)
+
+		--// Preview bar
+		local Preview = Header:Label({Text = ""})
+		Preview.AutomaticSize = Enum.AutomaticSize.None
+		Preview.Size = UDim2.new(1, 0, 0, 22)
+		Preview.BackgroundTransparency = 0
+		Preview.BackgroundColor3 = Value
+
+		local function ToHex(Color: Color3): string
+			return ("#%02X%02X%02X"):format(
+				math.floor(Color.R * 255 + 0.5),
+				math.floor(Color.G * 255 + 0.5),
+				math.floor(Color.B * 255 + 0.5)
+			)
+		end
+
+		local HueSlider, SatSlider, ValSlider, HexInput
+
+		--// Single place that updates everything (Source stops feedback loops)
+		local function Commit(Color: Color3, Source: string?)
+			if Busy then return end
+			Busy = true
+
+			Value = Color
+			Config.Value = Color
+			Preview.BackgroundColor3 = Color
+
+			if Source ~= "hsv" then
+				H, S, V = Color:ToHSV()
+				HueSlider:SetValue(H * 360)
+				SatSlider:SetValue(S * 100)
+				ValSlider:SetValue(V * 100)
+			end
+			if Source ~= "hex" then
+				HexInput:SetValue(ToHex(Color))
+			end
+
+			Busy = false
+
+			local Callback = Config.Callback
+			if Ready and Callback then
+				Callback(Header, Color)
+			end
+		end
+
+		local function FromSliders()
+			if not Ready then return end
+			Commit(Color3.fromHSV(H, S, V), "hsv")
+		end
+
+		HueSlider = Header:Slider({
+			Label = "Hue", MinValue = 0, MaxValue = 360, Value = H * 360,
+			Callback = function(_, NewValue)
+				H = NewValue / 360
+				FromSliders()
+			end
+		})
+		SatSlider = Header:Slider({
+			Label = "Saturation", MinValue = 0, MaxValue = 100, Value = S * 100,
+			Callback = function(_, NewValue)
+				S = NewValue / 100
+				FromSliders()
+			end
+		})
+		ValSlider = Header:Slider({
+			Label = "Brightness", MinValue = 0, MaxValue = 100, Value = V * 100,
+			Callback = function(_, NewValue)
+				V = NewValue / 100
+				FromSliders()
+			end
+		})
+		HexInput = Header:InputText({
+			Label = "Hex", Value = ToHex(Value), PlaceHolder = "#RRGGBB",
+			Callback = function(_, Text)
+				if not Ready then return end
+				local Hex = tostring(Text):match("^#?(%x%x%x%x%x%x)$")
+				if not Hex then return end
+
+				Commit(Color3.fromRGB(
+					tonumber(Hex:sub(1, 2), 16),
+					tonumber(Hex:sub(3, 4), 16),
+					tonumber(Hex:sub(5, 6), 16)
+				), "hex")
+			end
+		})
+
+		function Config:SetValue(Color: Color3)
+			if typeof(Color) == "Color3" then
+				Commit(Color)
+			end
+			return Config
+		end
+
+		ImGui:RegisterFlag(Config, "ColorPicker", function(NewValue)
+			Config:SetValue(NewValue)
+		end)
+
+		Ready = true
+		return Header
+	end
+
+	--// Save / load / delete / export / import configs (needs widgets created with `Flag = "..."`)
+	function ContainerClass:ConfigManager(Config)
+		Config = Config or {}
+		local Header = self:CollapsingHeader({
+			Title = Config.Title or "Configs",
+			Open = Config.Open ~= false
+		})
+
+		local Name = ""
+		local ImportText = ""
+
+		local function Report(Success: boolean, Result, Done: string)
+			ImGui:Notify({
+				Title = Success and Done or "Config error",
+				Text = not Success and tostring(Result) or nil,
+				Type = Success and "Success" or "Error"
+			})
+		end
+
+		local NameInput = Header:InputText({
+			Label = "Name", PlaceHolder = "config name",
+			Callback = function(_, Text)
+				Name = Text
+			end
+		})
+
+		local ConfigCombo
+		local function Refresh()
+			ConfigCombo.Items = ImGui:GetConfigs()
+		end
+
+		ConfigCombo = Header:Combo({
+			Label = "Saved", Placeholder = "Select a config", Items = ImGui:GetConfigs(),
+			Callback = function(_, Selected)
+				if typeof(Selected) == "string" and Selected ~= "" then
+					Name = Selected
+					NameInput:SetValue(Selected)
+				end
+			end
+		})
+
+		local Buttons = Header:Row({Spacing = 4})
+		Buttons:Button({Text = "Save", Callback = function()
+			local Success, Result = ImGui:SaveConfig(Name)
+			if Success then Refresh() end
+			Report(Success, Result, `Saved {Name}`)
+		end})
+		Buttons:Button({Text = "Load", Callback = function()
+			local Success, Result = ImGui:LoadConfig(Name)
+			Report(Success, Result, `Loaded {Name}`)
+		end})
+		Buttons:Button({Text = "Delete", Callback = function()
+			local Success, Result = ImGui:DeleteConfig(Name)
+			if Success then Refresh() end
+			Report(Success, Result, `Deleted {Name}`)
+		end})
+		Buttons:Fill()
+
+		--// Clipboard (works even when file functions are missing)
+		Header:Separator({Text = "Share"})
+
+		local Share = Header:Row({Spacing = 4})
+		Share:Button({Text = "Copy config", Callback = function()
+			if not setclipboard then
+				return Report(false, "setclipboard is not supported", "")
+			end
+			setclipboard(ImGui:ExportConfig())
+			Report(true, nil, "Config copied")
+		end})
+		Share:Fill()
+
+		Header:InputText({
+			Label = "Import", PlaceHolder = "paste config here",
+			Callback = function(_, Text)
+				ImportText = Text
+			end
+		})
+		Header:Button({Text = "Import pasted config", Callback = function()
+			local Success, Result = pcall(function()
+				return ImGui:ImportConfig(ImportText)
+			end)
+			Report(Success, Result, "Config imported")
+		end})
+
+		return Header
 	end
 
 	return ContainerClass
@@ -2115,10 +2800,31 @@ function ImGui:GetAnimation(Animation: boolean?)
 	return Animation and self.Animation or TweenInfo.new(0)
 end
 
+--// Returned instead of a real tween when properties are applied instantly
+local InstantTween = {
+	Completed = {
+		Connect = function(_, Callback)
+			Callback()
+			return {Disconnect = NullFunction}
+		end,
+		Wait = NullFunction
+	},
+	Play = NullFunction,
+	Cancel = NullFunction,
+	Pause = NullFunction
+}
+
 function ImGui:Tween(Instance: GuiObject, Props: SharedTable, tweenInfo, NoAnimation: false)
-	local tweenInfo = tweenInfo or ImGui:GetAnimation(not NoAnimation)
+	--// PERF: a zero length tween used to allocate a TweenService object per call (every widget did this on creation)
+	if NoAnimation or (not tweenInfo and not self.AnimationsEnabled) then
+		for Key, Value in next, Props do
+			Instance[Key] = Value
+		end
+		return InstantTween
+	end
+
 	local Tween = TweenService:Create(Instance, 
-		tweenInfo,
+		tweenInfo or self.Animation,
 		Props
 	)
 	Tween:Play()
@@ -2149,7 +2855,11 @@ function ImGui:ApplyAnimations(Instance: GuiObject, Class: string, Target: GuiOb
 
 	--// Reset colors
 	if Connections["MouseLeave"] then
-		Connections["MouseLeave"]()
+		--// PERF: set the resting state directly instead of creating a tween for every widget
+		local RestingTarget = Target or Instance
+		for Key, Value in next, ColorProps.MouseLeave do
+			RestingTarget[Key] = Value
+		end
 
 		--// FIX: MouseLeave is unreliable for touches, reset the hover state when the finger lifts
 		if UserInputService.TouchEnabled then
@@ -2213,57 +2923,72 @@ function ImGui:ConnectDrag(Config)
 	local Active: InputObject? = nil
 	local StartPosition: Vector3? = nil
 
-	local Connections = {}
+	--// PERF: the global InputChanged/InputEnded listeners are only connected while a drag is running.
+	--// Before, every slider/window/resize grip kept two of them alive for the whole session,
+	--// and InputChanged fires on every single mouse/touch move.
+	local MoveConnection: RBXScriptConnection? = nil
+	local EndConnection: RBXScriptConnection? = nil
 
-	local function IsActiveMove(Input: InputObject)
-		if not Active then return false end
+	local function Stop()
+		if MoveConnection then
+			MoveConnection:Disconnect()
+			MoveConnection = nil
+		end
+		if EndConnection then
+			EndConnection:Disconnect()
+			EndConnection = nil
+		end
+		Active = nil
+	end
+
+	local function OnMoved(Input: InputObject)
+		if not Active then return end
 
 		--// Touch InputObjects are reused for the life of the touch
 		if Active.UserInputType == Touch then
-			return Input == Active or Input.UserInputType == Touch
+			if Input ~= Active and Input.UserInputType ~= Touch then return end
+		elseif Input.UserInputType ~= MouseMovement then
+			return
 		end
-		return Input.UserInputType == MouseMovement
+
+		if Config.Moved then
+			Config.Moved(Input, Input.Position - StartPosition)
+		end
 	end
 
-	table.insert(Connections, Target.InputBegan:Connect(function(Input)
+	local function OnEnded(Input: InputObject)
+		if not Active then return end
+		if Input ~= Active and Input.UserInputType ~= Active.UserInputType then return end
+
+		Stop()
+		if Config.Ended then
+			Config.Ended(Input)
+		end
+	end
+
+	local BeganConnection = Target.InputBegan:Connect(function(Input)
 		if Active or not IsPointerStart(Input) then return end
 		if Config.CanStart and not Config.CanStart(Input) then return end
 
 		Active = Input
 		StartPosition = Input.Position
+		MoveConnection = UserInputService.InputChanged:Connect(OnMoved)
+		EndConnection = UserInputService.InputEnded:Connect(OnEnded)
 
 		if Config.Started then
 			Config.Started(Input)
 		end
-	end))
-
-	table.insert(Connections, UserInputService.InputChanged:Connect(function(Input)
-		if not IsActiveMove(Input) then return end
-		if Config.Moved then
-			Config.Moved(Input, Input.Position - StartPosition)
-		end
-	end))
-
-	table.insert(Connections, UserInputService.InputEnded:Connect(function(Input)
-		if not Active then return end
-		if Input ~= Active and Input.UserInputType ~= Active.UserInputType then return end
-
-		Active = nil
-		if Config.Ended then
-			Config.Ended(Input)
-		end
-	end))
+	end)
 
 	function Config:Disconnect()
-		for _, Connection in next, Connections do
-			Connection:Disconnect()
-		end
+		Stop()
+		BeganConnection:Disconnect()
 	end
 
-	--// FIX: global connections used to leak after a widget/window was destroyed
-	table.insert(Connections, Target.Destroying:Connect(function()
+	--// FIX: connections used to leak after a widget/window was destroyed
+	Target.Destroying:Connect(function()
 		Config:Disconnect()
-	end))
+	end)
 
 	return Config
 end
@@ -2376,7 +3101,12 @@ function ImGui:ApplyWindowSelectEffect(Window: GuiObject, TitleBar)
 		}
 	}
 
+	local Current = nil
 	local function SetSelected(Selected)
+		--// PERF: every click anywhere used to start 2 tweens per window, even when nothing changed
+		if Current == Selected then return end
+		Current = Selected
+
 		local Animations = ImGui.Animations
 		local Type = Selected and "Selected" or "Deselected"
 
@@ -2569,6 +3299,19 @@ function ImGui:CreateWindow(WindowConfig)
 		TabButton.Parent = ToolBar
 		Config.Button = TabButton
 
+		--// Active tab indicator (underline)
+		Config.Indicator = ImGui:CreateInstance("Frame", TabButton, {
+			Name = "Indicator",
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.fromScale(0, 1),
+			Size = UDim2.new(1, 0, 0, 2),
+			BackgroundColor3 = Color3.fromRGB(66, 150, 250),
+			BorderSizePixel = 0,
+			Visible = false
+		})
+		WindowConfig.Tabs = WindowConfig.Tabs or {}
+		table.insert(WindowConfig.Tabs, Config)
+
 		local AutoSizeAxis = WindowConfig.AutoSize or "Y"
 		local Content: Frame = Body.Template:Clone()
 		Content.AutomaticSize = Enum.AutomaticSize[AutoSizeAxis]
@@ -2602,6 +3345,11 @@ function ImGui:CreateWindow(WindowConfig)
 				local Size = Config:GetContentSize()
 				self:SetSize(Size)
 			end)
+		end
+
+		--// FIX: nothing was shown until a tab was clicked, the first tab is now selected automatically
+		if Config.Visible or not WindowConfig.ActiveTab then
+			WindowConfig:ShowTab(Config)
 		end
 
 		return Config
@@ -2649,6 +3397,14 @@ function ImGui:CreateWindow(WindowConfig)
 			Page.Visible = Page == TargetPage
 		end
 
+		--// Active tab indicator
+		for _, Tab in next, WindowConfig.Tabs or {} do
+			if Tab.Indicator then
+				Tab.Indicator.Visible = Tab == TabClass
+			end
+		end
+		WindowConfig.ActiveTab = TabClass
+
 		--// Page animation
 		ImGui:Tween(TargetPage, {
 			Position = UDim2.fromOffset(0, 0)
@@ -2694,6 +3450,23 @@ function ImGui:CreateWindow(WindowConfig)
 	--// Window section events
 	if not WindowConfig.NoSelectEffect then
 		ImGui:ApplyWindowSelectEffect(Window, TitleBar)
+	end
+
+	--// Keyboard shortcut to show/hide
+	if WindowConfig.ToggleKey then
+		local ToggleConnection = UserInputService.InputBegan:Connect(function(Input, Processed)
+			if Processed or Input.KeyCode ~= WindowConfig.ToggleKey then return end
+			WindowConfig:SetVisible(not Window.Visible)
+		end)
+		Window.Destroying:Connect(function()
+			ToggleConnection:Disconnect()
+		end)
+	end
+
+	--// Floating button on touch devices so a closed window can always be reopened
+	if ImGui.IsMobile and WindowConfig.MobileButton ~= false and not WindowConfig.Parent then
+		local MobileConfig = typeof(WindowConfig.MobileButton) == "table" and WindowConfig.MobileButton or nil
+		ImGui:CreateMobileButton(WindowConfig, MobileConfig)
 	end
 
 	return ImGui:MergeMetatables(WindowConfig, Window)
@@ -2786,5 +3559,21 @@ ImGui.FullScreenGui = CreateGui({
 	ResetOnSpawn = false,
 	ScreenInsets = Enum.ScreenInsets.None
 })
+
+--// Screen rotated / resized: keep windows usable
+ImGui.ScreenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	for Window, WindowConfig in next, ImGui.Windows do
+		if Window.Parent ~= ImGui.ScreenGui then continue end
+
+		local Size = ImGui:ClampSizeToScreen(Window.Size)
+		if Size ~= Window.Size then
+			Window.Size = Size
+			if WindowConfig.Open then
+				WindowConfig.Size = Size
+			end
+		end
+		ImGui:ClampWindowPosition(Window)
+	end
+end)
 
 return ImGui

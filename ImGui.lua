@@ -1,6 +1,25 @@
---// credit to https://github.com/depthso
-
---// rewrite for mobile support by claude
+--// Written by depso
+--// MIT License
+--// Copyright (c) 2024 Depso
+--//
+--// Maintained fork of Depso's Roblox ImGui (the original project is discontinued).
+--// Changes in this fork:
+--//  * Built-in UI prefabs, used automatically when the original asset can't be loaded
+--//  * Touch / mobile support (drag, resize, sliders, dropdowns, keybinds, window focus)
+--//  * Optional UIScale for touch-only devices + windows are kept on screen
+--//  * Bug fixes (see the notes next to each change marked with "FIX")
+--//  * New: ImGui:Notify, :ColorPicker, :ConfigManager, Flags + SaveConfig/LoadConfig,
+--//         floating open/close button on mobile, Slider `Increment`, InputText `Finished`,
+--//         window `ToggleKey`, active tab indicator, screen rotation handling, ImGui:Destroy()
+--//
+--// Quick start:
+--//   local Window = ImGui:CreateWindow({Title = "Hub", Size = UDim2.fromOffset(380, 300), ToggleKey = Enum.KeyCode.RightControl})
+--//   local Tab = Window:CreateTab({Name = "Main"})
+--//   Tab:Checkbox({Label = "ESP", Flag = "ESP", Callback = function(_, v) print(v) end})
+--//   Tab:Slider({Label = "Speed", MinValue = 0, MaxValue = 5, Increment = 0.1, Flag = "Speed"})
+--//   Tab:ColorPicker({Label = "Color", Value = Color3.new(1, 0, 0), Flag = "Color"})
+--//   Tab:ConfigManager()
+--//   ImGui:Notify({Title = "Loaded", Text = "Hello!", Type = "Success"})
 
 local ImGui = {
 	Animations = {
@@ -466,6 +485,27 @@ function ImGui:Notify(Config)
 	return Config
 end
 
+
+function ImGui:Destroy()
+	for Window in next, self.Windows do
+		pcall(function()
+			Window:Destroy()
+		end)
+	end
+
+	if self.NotifyHolder then
+		self.NotifyHolder:Destroy()
+		self.NotifyHolder = nil
+	end
+
+	self.ScreenGui:Destroy()
+	self.FullScreenGui:Destroy()
+	table.clear(self.FlagObjects)
+end
+
+--// Built-in prefabs 
+--// Used when the original asset can't be loaded (deleted, GetObjects unsupported, ...)
+--// The hierarchy/names match what the rest of this file expects.
 function ImGui:BuildFallbackUI()
 	local Theme = {
 		WindowBg = Color3.fromRGB(15, 15, 15),
@@ -499,6 +539,7 @@ function ImGui:BuildFallbackUI()
 		return Object
 	end
 
+	--// Frame/Text constructors with shared defaults
 	local function Box(ClassName: string, Properties, Children)
 		local Props = {
 			BorderSizePixel = 0,
@@ -3357,11 +3398,6 @@ function ImGui:CreateWindow(WindowConfig)
 		end)
 	end
 
-	--// Floating button on touch devices so a closed window can always be reopened
-	if ImGui.IsMobile and WindowConfig.MobileButton ~= false and not WindowConfig.Parent then
-		local MobileConfig = typeof(WindowConfig.MobileButton) == "table" and WindowConfig.MobileButton or nil
-		ImGui:CreateMobileButton(WindowConfig, MobileConfig)
-	end
 
 	return ImGui:MergeMetatables(WindowConfig, Window)
 end

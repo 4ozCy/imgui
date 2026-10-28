@@ -1,5 +1,6 @@
---// credit to depso
+--// credit to https://github.com/depthso
 
+--// rewrite for mobile support by claude
 
 local ImGui = {
 	Animations = {
@@ -465,92 +466,6 @@ function ImGui:Notify(Config)
 	return Config
 end
 
---// Floating open/close button (touch devices have no toggle key)
-function ImGui:CreateMobileButton(WindowConfig, Config)
-	Config = Config or {}
-	local Window: Frame = WindowConfig.Window
-
-	self.MobileButtons = (self.MobileButtons or 0) + 1
-	local Index = self.MobileButtons - 1
-
-	local Button = self:CreateInstance("TextButton", self.ScreenGui, {
-		Name = "MobileToggle",
-		Text = Config.Text or WindowConfig.MobileButtonText or "UI",
-		Font = Enum.Font.Code,
-		TextSize = 14,
-		TextColor3 = Color3.fromRGB(255, 255, 255),
-		AutoButtonColor = false,
-		Size = UDim2.fromOffset(44, 44),
-		Position = Config.Position or UDim2.new(0, 10, 0.35, Index * 50),
-		BackgroundColor3 = Color3.fromRGB(41, 74, 122),
-		BackgroundTransparency = 0.15,
-		BorderSizePixel = 0,
-		ZIndex = 200
-	})
-	self:CreateInstance("UICorner", Button, {CornerRadius = UDim.new(1, 0)})
-	self:CreateInstance("UIStroke", Button, {
-		Color = Color3.fromRGB(110, 110, 128),
-		Transparency = 0.4,
-		Thickness = 1
-	})
-	self:CreateInstance("UIScale", Button, {Scale = self:GetScale()})
-
-	--// Draggable, but a tap still toggles the window
-	local Dragged = 0
-	local StartPosition = Button.Position
-
-	self:ConnectDrag({
-		Target = Button,
-		Started = function()
-			Dragged = 0
-			StartPosition = Button.Position
-		end,
-		Moved = function(Input, Delta)
-			Dragged = math.max(Dragged, math.abs(Delta.X) + math.abs(Delta.Y))
-			if Dragged <= 8 then return end
-
-			Button.Position = UDim2.new(
-				StartPosition.X.Scale, StartPosition.X.Offset + Delta.X,
-				StartPosition.Y.Scale, StartPosition.Y.Offset + Delta.Y
-			)
-		end,
-		Ended = function()
-			ImGui:ClampWindowPosition(Button)
-		end
-	})
-
-	Button.Activated:Connect(function()
-		if Dragged > 8 then return end
-		WindowConfig:SetVisible(not Window.Visible)
-	end)
-
-	Window.Destroying:Connect(function()
-		Button:Destroy()
-	end)
-
-	return Button
-end
-
-function ImGui:Destroy()
-	for Window in next, self.Windows do
-		pcall(function()
-			Window:Destroy()
-		end)
-	end
-
-	if self.NotifyHolder then
-		self.NotifyHolder:Destroy()
-		self.NotifyHolder = nil
-	end
-
-	self.ScreenGui:Destroy()
-	self.FullScreenGui:Destroy()
-	table.clear(self.FlagObjects)
-end
-
---// Built-in prefabs 
---// Used when the original asset can't be loaded (deleted, GetObjects unsupported, ...)
---// The hierarchy/names match what the rest of this file expects.
 function ImGui:BuildFallbackUI()
 	local Theme = {
 		WindowBg = Color3.fromRGB(15, 15, 15),
@@ -584,7 +499,6 @@ function ImGui:BuildFallbackUI()
 		return Object
 	end
 
-	--// Frame/Text constructors with shared defaults
 	local function Box(ClassName: string, Properties, Children)
 		local Props = {
 			BorderSizePixel = 0,

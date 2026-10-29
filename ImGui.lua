@@ -1,25 +1,5 @@
 --// Written by depso
---// MIT License
---// Copyright (c) 2024 Depso
---//
---// Maintained fork of Depso's Roblox ImGui (the original project is discontinued).
---// Changes in this fork:
---//  * Built-in UI prefabs, used automatically when the original asset can't be loaded
---//  * Touch / mobile support (drag, resize, sliders, dropdowns, keybinds, window focus)
---//  * Optional UIScale for touch-only devices + windows are kept on screen
---//  * Bug fixes (see the notes next to each change marked with "FIX")
---//  * New: ImGui:Notify, :ColorPicker, :ConfigManager, Flags + SaveConfig/LoadConfig,
---//         Slider `Increment`, InputText `Finished`,
---//         window `ToggleKey`, active tab indicator, screen rotation handling, ImGui:Destroy()
---//
---// Quick start:
---//   local Window = ImGui:CreateWindow({Title = "Hub", Size = UDim2.fromOffset(380, 300), ToggleKey = Enum.KeyCode.RightControl})
---//   local Tab = Window:CreateTab({Name = "Main"})
---//   Tab:Checkbox({Label = "ESP", Flag = "ESP", Callback = function(_, v) print(v) end})
---//   Tab:Slider({Label = "Speed", MinValue = 0, MaxValue = 5, Increment = 0.1, Flag = "Speed"})
---//   Tab:ColorPicker({Label = "Color", Value = Color3.new(1, 0, 0), Flag = "Color"})
---//   Tab:ConfigManager()
---//   ImGui:Notify({Title = "Loaded", Text = "Hello!", Type = "Success"})
+--// rewrite for mobile support by Claude
 
 local ImGui = {
 	Animations = {

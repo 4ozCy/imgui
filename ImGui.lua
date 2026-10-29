@@ -1,6 +1,25 @@
 --// Written by depso
-
---// rewrite for mobile support by Claude
+--// MIT License
+--// Copyright (c) 2024 Depso
+--//
+--// Maintained fork of Depso's Roblox ImGui (the original project is discontinued).
+--// Changes in this fork:
+--//  * Built-in UI prefabs, used automatically when the original asset can't be loaded
+--//  * Touch / mobile support (drag, resize, sliders, dropdowns, keybinds, window focus)
+--//  * Optional UIScale for touch-only devices + windows are kept on screen
+--//  * Bug fixes (see the notes next to each change marked with "FIX")
+--//  * New: ImGui:Notify, :ColorPicker, :ConfigManager, Flags + SaveConfig/LoadConfig,
+--//         Slider `Increment`, InputText `Finished`,
+--//         window `ToggleKey`, active tab indicator, screen rotation handling, ImGui:Destroy()
+--//
+--// Quick start:
+--//   local Window = ImGui:CreateWindow({Title = "Hub", Size = UDim2.fromOffset(380, 300), ToggleKey = Enum.KeyCode.RightControl})
+--//   local Tab = Window:CreateTab({Name = "Main"})
+--//   Tab:Checkbox({Label = "ESP", Flag = "ESP", Callback = function(_, v) print(v) end})
+--//   Tab:Slider({Label = "Speed", MinValue = 0, MaxValue = 5, Increment = 0.1, Flag = "Speed"})
+--//   Tab:ColorPicker({Label = "Color", Value = Color3.new(1, 0, 0), Flag = "Color"})
+--//   Tab:ConfigManager()
+--//   ImGui:Notify({Title = "Loaded", Text = "Hello!", Type = "Success"})
 
 local ImGui = {
 	Animations = {
@@ -466,7 +485,6 @@ function ImGui:Notify(Config)
 	return Config
 end
 
-
 function ImGui:Destroy()
 	for Window in next, self.Windows do
 		pcall(function()
@@ -632,7 +650,7 @@ function ImGui:BuildFallbackUI()
 		Visible = false,
 	}, {
 		Stroke(),
-		Corner(4),
+		--// PERF: no UICorner here. ClipsDescendants + UICorner forces a rounded mask every frame, a plain clip is much cheaper
 		Box("Frame", {
 			Name = "Content",
 			Size = UDim2.fromScale(1, 1),
@@ -742,8 +760,6 @@ function ImGui:BuildFallbackUI()
 	}, {
 		Padding(10, 0, 10, 0),
 		Corner(3),
-		Stroke(false),
-		Gradient(),
 	}))
 
 	--// Image
@@ -755,8 +771,6 @@ function ImGui:BuildFallbackUI()
 		AutoButtonColor = false,
 	}, {
 		Corner(3),
-		Stroke(false),
-		Gradient(),
 	}))
 
 	--// ScrollBox
@@ -1028,7 +1042,6 @@ function ImGui:BuildFallbackUI()
 			BackgroundTransparency = 0,
 		}, {
 			Corner(3),
-			Gradient(),
 		}),
 		Text("TextLabel", {
 			Name = "ValueText",
@@ -1229,7 +1242,17 @@ local AddionalStyles = {
 		Name="Border"
 	}] = function(GuiObject: GuiObject, Value, Class)
 		local Outline = GuiObject:FindFirstChildOfClass("UIStroke")
-		if not Outline then return end
+		if not Outline then
+			if not Value then return end
+
+			--// PERF: widgets no longer ship an unused (disabled) UIStroke, it is created on demand
+			Outline = ImGui:CreateInstance("UIStroke", GuiObject, {
+				Color = Color3.fromRGB(110, 110, 128),
+				Thickness = 1,
+				Transparency = 0.5,
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+			})
+		end
 
 		local BorderThickness = Class.BorderThickness
 		if BorderThickness then
@@ -2115,6 +2138,7 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			Label.Position = UDim2.new(1, 15-Diff.Offset, 0, 0)
 		end
 
+		local LastPercentage = nil
 		function Config:SetValue(Value: number, Slider: false, Instant: boolean?)
 			local MinValue = Config.MinValue
 			local MaxValue = Config.MaxValue
@@ -2140,6 +2164,12 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			end
 
 			Percentage = math.clamp(Percentage, 0, 1)
+
+			--// PERF: still inside the same step while dragging, nothing to redraw and no callback to fire
+			if Instant and Slider and Value == Config.Value and Percentage == LastPercentage then
+				return Config
+			end
+			LastPercentage = Percentage
 
 			--// Animate grab
 			local Props = {
@@ -2692,7 +2722,16 @@ function ImGui:Dropdown(Config)
 			return SetValue(Value)
 		end)
 
-		self:ApplyAnimations(NewItem, "Tabs")
+		--// PERF: plain instant hover for list items (no tweens, nothing at all on touch screens)
+		NewItem.BackgroundTransparency = 1
+		if not self.IsMobile then
+			NewItem.MouseEnter:Connect(function()
+				NewItem.BackgroundTransparency = 0.5
+			end)
+			NewItem.MouseLeave:Connect(function()
+				NewItem.BackgroundTransparency = 1
+			end)
+		end
 	end
 
 	--// Configure size of the frame
@@ -2766,7 +2805,11 @@ function ImGui:ApplyAnimations(Instance: GuiObject, Class: string, Target: GuiOb
 
 		--// Connections
 		Connections[Connection] = Callback
-		Instance[Connection]:Connect(Callback)
+
+		--// Touch has no hover, it is driven by the finger below (saves a connection per widget)
+		if not ImGui.IsMobile then
+			Instance[Connection]:Connect(Callback)
+		end
 	end
 
 	--// Reset colors
@@ -2779,7 +2822,17 @@ function ImGui:ApplyAnimations(Instance: GuiObject, Class: string, Target: GuiOb
 
 		--// FIX: MouseLeave is unreliable for touches, reset the hover state when the finger lifts
 		if UserInputService.TouchEnabled then
+			local MouseEnter = Connections["MouseEnter"]
 			local MouseLeave = Connections["MouseLeave"]
+
+			if ImGui.IsMobile and MouseEnter then
+				Instance.InputBegan:Connect(function(Input)
+					if Input.UserInputType == Touch then
+						MouseEnter()
+					end
+				end)
+			end
+
 			Instance.InputEnded:Connect(function(Input)
 				if Input.UserInputType == Touch then
 					MouseLeave()
@@ -2838,12 +2891,24 @@ function ImGui:ConnectDrag(Config)
 	local Target: GuiObject = Config.Target
 	local Active: InputObject? = nil
 	local StartPosition: Vector3? = nil
+	local Pending: InputObject? = nil
 
-	--// PERF: the global InputChanged/InputEnded listeners are only connected while a drag is running.
-	--// Before, every slider/window/resize grip kept two of them alive for the whole session,
-	--// and InputChanged fires on every single mouse/touch move.
+	--// PERF: the global listeners only exist while a drag is running
 	local MoveConnection: RBXScriptConnection? = nil
 	local EndConnection: RBXScriptConnection? = nil
+	local FrameConnection: RBXScriptConnection? = nil
+
+	--// PERF: input can arrive several times per frame (mouse polling), but resizing/relayout is only
+	--// needed once per frame. Moves are collected and applied once, right before rendering.
+	local function Flush()
+		local Input = Pending
+		if not Input or not Active then return end
+		Pending = nil
+
+		if Config.Moved then
+			Config.Moved(Input, Input.Position - StartPosition)
+		end
+	end
 
 	local function Stop()
 		if MoveConnection then
@@ -2854,6 +2919,11 @@ function ImGui:ConnectDrag(Config)
 			EndConnection:Disconnect()
 			EndConnection = nil
 		end
+		if FrameConnection then
+			FrameConnection:Disconnect()
+			FrameConnection = nil
+		end
+		Pending = nil
 		Active = nil
 	end
 
@@ -2867,15 +2937,14 @@ function ImGui:ConnectDrag(Config)
 			return
 		end
 
-		if Config.Moved then
-			Config.Moved(Input, Input.Position - StartPosition)
-		end
+		Pending = Input
 	end
 
 	local function OnEnded(Input: InputObject)
 		if not Active then return end
 		if Input ~= Active and Input.UserInputType ~= Active.UserInputType then return end
 
+		Flush() --// Never lose the last movement
 		Stop()
 		if Config.Ended then
 			Config.Ended(Input)
@@ -2890,6 +2959,7 @@ function ImGui:ConnectDrag(Config)
 		StartPosition = Input.Position
 		MoveConnection = UserInputService.InputChanged:Connect(OnMoved)
 		EndConnection = UserInputService.InputEnded:Connect(OnEnded)
+		FrameConnection = RunService.RenderStepped:Connect(Flush)
 
 		if Config.Started then
 			Config.Started(Input)
